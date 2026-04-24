@@ -1,10 +1,8 @@
 """HA REST API wrapper with sign-convention normalization."""
 import logging
-from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import httpx
-import pandas as pd
 
 from config import Config
 
@@ -39,43 +37,6 @@ class HAClient:
         url = f"{self._base}/api/services/{domain}/{service}"
         r = httpx.post(url, headers=self._headers, json=data, timeout=TIMEOUT)
         r.raise_for_status()
-
-    def get_statistics_30min(
-        self, entity_ids: list[str], days_back: int = 365
-    ) -> dict[str, pd.Series]:
-        """Fetch HA long-term statistics (hourly) and upsample to 30-min."""
-        start_time = (datetime.now(timezone.utc) - timedelta(days=days_back)).isoformat()
-        r = httpx.post(
-            f"{self._base}/api/statistics_during_period",
-            headers=self._headers,
-            json={
-                "start_time": start_time,
-                "statistic_ids": entity_ids,
-                "period": "hour",
-                "types": ["mean", "sum"],
-            },
-            timeout=60.0,
-        )
-        r.raise_for_status()
-        data: dict = r.json()
-        result: dict[str, pd.Series] = {}
-        for eid, records in data.items():
-            if not records:
-                result[eid] = pd.Series(dtype=float)
-                continue
-            index = pd.to_datetime([rec["start"] for rec in records], utc=True)
-            # prefer mean for power/temp; fall back to sum for energy sensors
-            values = [
-                rec.get("mean") if rec.get("mean") is not None else rec.get("sum")
-                for rec in records
-            ]
-            s = pd.Series(values, index=index, dtype=float).dropna()
-            if s.empty:
-                result[eid] = s
-                continue
-            # Upsample 1h → 30min: forward-fill hourly value into both sub-slots
-            result[eid] = s.resample("30min").ffill()
-        return result
 
     @property
     def soc_percent(self) -> float:

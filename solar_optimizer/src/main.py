@@ -169,7 +169,6 @@ def replan(
 
         pv_total = sum(pv_forecast)
         if pv_total > 0:
-            grid_import = sum(result.grid_import_kwh)
             self_cons = max(0.0, (pv_total - sum(result.grid_export_kwh)) / pv_total * 100)
             mqtt.publish_self_consumption(self_cons)
 
@@ -181,7 +180,7 @@ def replan(
             executor.failsafe()
 
 
-def _try_train(cfg: Config, ha: HAClient, influx: InfluxClient, forecaster: LoadForecaster) -> int:
+def _try_train(cfg: Config, influx: InfluxClient, forecaster: LoadForecaster) -> int:
     """Attempt ML training; return phase (2 if trained, 1 otherwise)."""
     if not cfg.ml_enabled:
         return 1
@@ -202,7 +201,7 @@ def _try_train(cfg: Config, ha: HAClient, influx: InfluxClient, forecaster: Load
             influx_days,
         )
         try:
-            ha_df = build_training_features_ha_stats(ha, days_back=365)
+            ha_df = build_training_features_ha_stats(days_back=365)
             if not ha_df.empty and forecaster.train_from_df(ha_df):
                 return 2
         except Exception as exc:
@@ -224,14 +223,14 @@ def main() -> None:
 
     mqtt.connect()
 
-    phase = _try_train(cfg, ha, influx, forecaster)
+    phase = _try_train(cfg, influx, forecaster)
 
     def _replan():
         replan(cfg, ha, influx, executor, mqtt, forecaster, phase)
 
     def _retrain():
         nonlocal phase
-        new_phase = _try_train(cfg, ha, influx, forecaster)
+        new_phase = _try_train(cfg, influx, forecaster)
         if new_phase != phase:
             log.info("Phase changed %d → %d after retrain", phase, new_phase)
             phase = new_phase

@@ -66,13 +66,14 @@ def build_training_features(influx: InfluxClient, days_back: int = 90) -> pd.Dat
     return df
 
 
-def build_training_features_ha_stats(ha, days_back: int = 365) -> pd.DataFrame:
-    """Build training features from HA long-term statistics (hourly → 30-min).
+def build_training_features_ha_stats(days_back: int = 365) -> pd.DataFrame:
+    """Build training features from HA long-term statistics (SQLite, hourly → 30-min).
 
-    Used as a fallback when InfluxDB has insufficient history.
-    HA statistics API returns hourly means; each hour is replicated into both
-    30-min sub-slots via forward-fill.
+    Used as a fallback when InfluxDB has < 30 days of data. Reads directly from
+    the HA recorder SQLite DB mounted at /homeassistant via map: homeassistant:ro.
     """
+    from ha_statistics_client import get_ha_statistics_30min
+
     entity_ids = [
         "sensor.house_consumption_power",
         "sensor.heiko_heat_pump_electrical_power",
@@ -81,10 +82,9 @@ def build_training_features_ha_stats(ha, days_back: int = 365) -> pd.DataFrame:
         "sensor.miernik_energii_klimatyzacje_power_b",
         "sensor.temperature_weather_station",
     ]
-    try:
-        stats = ha.get_statistics_30min(entity_ids, days_back=days_back)
-    except Exception as exc:
-        log.warning("HA statistics fetch failed: %s", exc)
+    stats = get_ha_statistics_30min(entity_ids, days_back=days_back)
+    if not stats:
+        log.warning("HA statistics returned no data")
         return pd.DataFrame()
 
     def _w_to_kwh(s: pd.Series) -> pd.Series:
@@ -101,7 +101,7 @@ def build_training_features_ha_stats(ha, days_back: int = 365) -> pd.DataFrame:
     df = pd.concat([house, hp, ac_p, ac_d, pv, temp], axis=1, join="outer")
     df.columns = ["house_kwh", "hp_kwh", "ac_pietro_kwh", "ac_poddasze_kwh",
                   "pv_kwh", "outdoor_temp"]
-    df["ac_salon_kwh"] = 0.0  # cumulative kWh sensor not in statistics API
+    df["ac_salon_kwh"] = 0.0  # cumulative kWh sensor, not stored as mean in statistics
 
     for col in ["hp_kwh", "ac_salon_kwh", "ac_pietro_kwh", "ac_poddasze_kwh", "pv_kwh"]:
         df[col] = df[col].fillna(0.0)
