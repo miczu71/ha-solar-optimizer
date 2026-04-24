@@ -112,6 +112,15 @@ class InfluxClient:
         combined["slot"] = combined.index.hour * 2 + combined.index.minute // 30
         return combined.groupby("slot")["base"].mean()
 
+    def pv_total_yesterday(self) -> float:
+        """Return total PV generation (kWh) for yesterday (UTC date)."""
+        pv = self.pv_power_30min(days_back=2)
+        if pv.empty:
+            return 5.0
+        yesterday = (datetime.now(timezone.utc) - timedelta(days=1)).date()
+        pv_yest = pv[pv.index.date == yesterday]
+        return float(pv_yest.sum()) if not pv_yest.empty else 5.0
+
     def check_data_availability(self) -> dict[str, int]:
         """Return number of days (out of last 90) that have at least one data point."""
         sensors = {
@@ -130,7 +139,6 @@ class InfluxClient:
                 res = self._client.query(q)
                 if res:
                     df = list(res.values())[0]
-                    # Count days that have at least one record
                     result[key] = int((df.iloc[:, 0] > 0).sum())
                 else:
                     result[key] = 0

@@ -211,6 +211,14 @@ class MQTTPublisher:
             retain=True,
         )
 
+    def publish_grid_import_avoided(self, kwh: float) -> None:
+        """Publish kWh saved vs naive no-dispatch baseline."""
+        self._client.publish(
+            self._state_topic("sensor", "grid_import_avoided_kwh"),
+            json.dumps({"state": round(kwh, 3)}),
+            retain=True,
+        )
+
     def publish_forecast_error(self, mape: float) -> None:
         self._client.publish(
             self._state_topic("sensor", "load_forecast_error_24h"),

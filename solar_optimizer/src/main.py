@@ -84,14 +84,30 @@ def build_base_load_forecast(
     if phase == 2 and forecaster.is_ready():
         try:
             outdoor = ha.outdoor_temp
+            # Fetch real per-slot lag values from InfluxDB; fall back to defaults on error
+            lag_1d = {}
+            lag_7d = {}
+            pv_yesterday = 5.0
+            try:
+                lag_1d = influx.rolling_mean_base_load(days_back=1)
+            except Exception as exc:
+                log.debug("lag_1d InfluxDB fetch failed: %s", exc)
+            try:
+                lag_7d = influx.rolling_mean_base_load(days_back=7)
+            except Exception as exc:
+                log.debug("lag_7d InfluxDB fetch failed: %s", exc)
+            try:
+                pv_yesterday = influx.pv_total_yesterday()
+            except Exception as exc:
+                log.debug("pv_yesterday InfluxDB fetch failed: %s", exc)
             rows = [
                 build_forecast_row(
                     slot=s,
                     now=now_local,
                     outdoor_temp=outdoor,
-                    lag_1d=0.3,
-                    lag_7d=0.3,
-                    pv_yesterday_kwh=5.0,
+                    lag_1d=float(lag_1d.get(s, 0.3)),
+                    lag_7d=float(lag_7d.get(s, 0.3)),
+                    pv_yesterday_kwh=pv_yesterday,
                 )
                 for s in range(48)
             ]
@@ -161,7 +177,17 @@ def replan(
         dhw_temp = ha.dhw_tank_temp
         outdoor = ha.outdoor_temp
 
+        # Compute current slot before building dhw_demand_slots
+        slot = now_local.hour * 2 + now_local.minute // 30
+
+        # If a bath has been requested, mark next 2 hours (4 slots) as DHW demand
+        # so the LP ensures the tank is hot enough by then.
         dhw_demand_slots = [False] * 48
+        if ha.bath_request:
+            demand_end = min(48, slot + 4)
+            for t in range(slot, demand_end):
+                dhw_demand_slots[t] = True
+            log.info("Bath requested: marking slots %d–%d as DHW demand", slot, demand_end - 1)
 
         result = run_optimizer(
             cfg=cfg,
@@ -188,7 +214,6 @@ def replan(
             return
 
         _consecutive_failures = 0
-        slot = now_local.hour * 2 + now_local.minute // 30
 
         if not cfg.shadow_mode:
             executor.apply_slot(
@@ -211,6 +236,11 @@ def replan(
         if pv_total > 0:
             self_cons = max(0.0, (pv_total - sum(result.grid_export_kwh)) / pv_total * 100)
             mqtt.publish_self_consumption(self_cons)
+
+        # Grid import avoided: naive (no-dispatch) baseline minus optimised import
+        naive_import = sum(max(0.0, base_load[t] - pv_forecast[t]) for t in range(48))
+        avoided = max(0.0, naive_import - sum(result.grid_import_kwh))
+        mqtt.publish_grid_import_avoided(avoided)
 
         _save_daily_summary(result, now_local, phase)
 
@@ -268,8 +298,7 @@ def main() -> None:
     mqtt.connect()
 
     # Start HTTP server in a daemon thread immediately so the dashboard is
-    # available and shows "Starting up..." during training and the first replan.
-    # Previously uvicorn.run() was the last line, blocking for 60-90 s after startup.
+    # available and shows status during training and the first replan.
     server_thread = threading.Thread(
         target=uvicorn.run,
         kwargs={"app": app, "host": "0.0.0.0", "port": 8099, "log_level": "warning"},
