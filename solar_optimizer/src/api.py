@@ -23,10 +23,6 @@ def set_state(key: str, value: Any) -> None:
     _state[key] = value
 
 
-# ---------------------------------------------------------------------------
-# Dashboard HTML (all data fetched by JS from /status and /schedule)
-# ---------------------------------------------------------------------------
-
 _DASHBOARD_HTML = """\
 <!DOCTYPE html>
 <html lang="en">
@@ -58,6 +54,7 @@ a{color:var(--bl);text-decoration:none}a:hover{text-decoration:underline}
 .sep{color:var(--b);margin:0 8px}
 .legend{display:flex;flex-wrap:wrap;gap:12px;margin-bottom:8px;font-size:.76em}
 .dot{display:inline-block;width:10px;height:10px;border-radius:2px;margin-right:4px}
+.msg{color:var(--m);font-size:.84em;padding:12px 0}
 </style>
 </head>
 <body>
@@ -73,7 +70,7 @@ a{color:var(--bl);text-decoration:none}a:hover{text-decoration:underline}
 </div>
 
 <div id="panel-status" class="panel active">
-  <table><tbody id="st"></tbody></table>
+  <div id="st-wrap"><p class="msg">&#8987; Connecting to server&hellip;</p></div>
 </div>
 
 <div id="panel-plan" class="panel">
@@ -91,6 +88,7 @@ a{color:var(--bl);text-decoration:none}a:hover{text-decoration:underline}
     <div class="ct">Battery SoC &amp; DHW temperature</div>
     <canvas id="ct" height="95"></canvas>
   </div>
+  <div id="plan-msg"></div>
   <div style="overflow-x:auto">
     <table>
       <thead><tr>
@@ -120,7 +118,7 @@ a{color:var(--bl);text-decoration:none}a:hover{text-decoration:underline}
 </div>
 
 <script>
-let eChart=null,tChart=null,planLoaded=false,histLoaded=false;
+let eChart=null,tChart=null,planLoaded=false,histLoaded=false,_retryTimer=null;
 const SL=Array.from({length:48},(_,i)=>`${String(i>>1).padStart(2,'0')}:${i&1?'30':'00'}`);
 const CO={responsive:true,interaction:{intersect:false,mode:'index'},
   plugins:{legend:{display:false},
@@ -138,6 +136,8 @@ function showTab(n,b){
 async function loadStatus(){
   try{
     const d=await fetch('/status').then(r=>r.json());
+    // Server is responding — cancel startup retry timer
+    if(_retryTimer){clearInterval(_retryTimer);_retryTimer=null;}
     document.getElementById('ver').textContent='v'+(d.version||'?');
     document.getElementById('phase-b').textContent=d.phase===2?'Phase 2 — LightGBM ML':'Phase 1 — Rolling Mean';
     const sc=d.solver_status==='Optimal'?'#4ade80':'#f87171';
@@ -148,17 +148,22 @@ async function loadStatus(){
       ['PV forecast today',d.pv_forecast_kwh!=null?d.pv_forecast_kwh.toFixed(2)+' kWh':'—'],
       ['Load forecast today',d.load_forecast_kwh!=null?d.load_forecast_kwh.toFixed(2)+' kWh':'—'],
     ];
-    document.getElementById('st').innerHTML=rows.map(([k,v])=>`<tr><td style="color:#94a3b8;width:55%">${k}</td><td>${v}</td></tr>`).join('');
-  }catch(e){}
+    document.getElementById('st-wrap').innerHTML='<table><tbody>'+rows.map(([k,v])=>`<tr><td style="color:#94a3b8;width:55%">${k}</td><td>${v}</td></tr>`).join('')+'</tbody></table>';
+  }catch(e){
+    document.getElementById('st-wrap').innerHTML='<p class="msg">&#8987; Starting up… retrying in 5 s</p>';
+    if(!_retryTimer){_retryTimer=setInterval(loadStatus,5000);}
+  }
 }
 
 async function loadPlan(){
   try{
     const d=await fetch('/schedule').then(r=>r.json());
     if(!d.slots||!d.slots.length){
-      document.getElementById('pt').innerHTML='<tr><td colspan=8 style="color:#94a3b8">No plan yet — waiting for first run</td></tr>';return;
+      document.getElementById('plan-msg').innerHTML='<p class="msg">No plan yet — waiting for first replan</p>';
+      return;
     }
     planLoaded=true;
+    document.getElementById('plan-msg').innerHTML='';
     const s=d.slots;
     const yAx=(id,pos,clr,mn,mx,lbl)=>({
       type:'linear',position:pos,min:mn,max:mx,
@@ -207,7 +212,11 @@ async function loadPlan(){
     }).join('');
     const rows=document.getElementById('pt').querySelectorAll('tr');
     if(rows[cur])rows[cur].scrollIntoView({block:'center'});
-  }catch(e){console.error('Plan load error:',e);}
+  }catch(e){
+    document.getElementById('plan-msg').innerHTML='<p class="msg">&#8987; Server starting up — try again in a moment</p>';
+    planLoaded=false;
+    console.error('Plan load error:',e);
+  }
 }
 
 async function loadHistory(){
@@ -226,7 +235,10 @@ async function loadHistory(){
         <td style="color:#f87171">${(r.grid_import_total_kwh||0).toFixed(2)}</td>
         <td>${sc}</td></tr>`;
     }).join('');
-  }catch(e){document.getElementById('ht').innerHTML='<tr><td colspan=6 style="color:#f87171">Error loading history</td></tr>';}
+  }catch(e){
+    document.getElementById('ht').innerHTML='<tr><td colspan=6 style="color:#94a3b8">&#8987; Server starting up — click History again in a moment</td></tr>';
+    histLoaded=false;  // allow retry on next tab click
+  }
 }
 
 async function triggerReplan(){
@@ -269,7 +281,7 @@ async def schedule() -> JSONResponse:
     if result is None:
         raise HTTPException(status_code=503, detail="No schedule available yet")
 
-    cop = 3.0  # default DHW COP for display
+    cop = 3.0
     slots = []
     for t in range(48):
         h, m = divmod(t * 30, 60)
@@ -301,7 +313,6 @@ async def history() -> JSONResponse:
         with open("/data/plan_history.jsonl") as f:
             lines = f.readlines()
         records = [json.loads(l) for l in lines if l.strip()]
-        # Keep the last record per calendar date
         by_date: dict[str, Any] = {}
         for r in records:
             d = r.get("date", "")

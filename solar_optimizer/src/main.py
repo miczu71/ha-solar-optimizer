@@ -3,6 +3,7 @@ import json
 import logging
 import re
 import sys
+import threading
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -37,7 +38,7 @@ def _read_addon_version() -> str:
     try:
         with open("/app/addon_config.yaml") as f:
             for line in f:
-                m = re.match(r'^version:\s*["\']?([^"\'\ s]+)["\']?', line)
+                m = re.match(r'^version:\s*["\']?([^"\'\ \\s]+)["\']?', line)
                 if m:
                     return m.group(1)
     except Exception:
@@ -61,7 +62,6 @@ def build_pv_forecast(ha: HAClient) -> list[float]:
             if not period_start:
                 continue
             dt = datetime.fromisoformat(period_start.replace("Z", "+00:00"))
-            # Normalize to HA local timezone; if naive, assume it's already local
             dt_local = dt.astimezone(ha.tz) if dt.tzinfo else dt.replace(tzinfo=ha.tz)
             if dt_local.date() != now_local.date():
                 continue
@@ -126,7 +126,6 @@ def _save_daily_summary(result: OptimizeResult, now_local: datetime, phase: int)
         }
         with open(_HISTORY_FILE, "a") as f:
             f.write(json.dumps(record) + "\n")
-        # Trim to keep only the most recent records
         with open(_HISTORY_FILE) as f:
             lines = f.readlines()
         if len(lines) > _HISTORY_MAX_RECORDS:
@@ -151,8 +150,8 @@ def replan(
             log.info("Optimizer disabled via switch, skipping replan")
             return
 
-        now_utc = datetime.now(timezone.utc)   # UTC for timestamps / logging
-        now_local = ha.local_now               # HA local time for slots and G12W peak vector
+        now_utc = datetime.now(timezone.utc)
+        now_local = ha.local_now
 
         pv_forecast = build_pv_forecast(ha)
         base_load = build_base_load_forecast(influx, forecaster, ha, cfg, now_local, phase)
@@ -268,6 +267,17 @@ def main() -> None:
 
     mqtt.connect()
 
+    # Start HTTP server in a daemon thread immediately so the dashboard is
+    # available and shows "Starting up..." during training and the first replan.
+    # Previously uvicorn.run() was the last line, blocking for 60-90 s after startup.
+    server_thread = threading.Thread(
+        target=uvicorn.run,
+        kwargs={"app": app, "host": "0.0.0.0", "port": 8099, "log_level": "warning"},
+        daemon=True,
+    )
+    server_thread.start()
+    log.info("HTTP server starting on port 8099")
+
     phase = _try_train(cfg, influx, forecaster)
     set_state("phase", phase)
     set_state("version", version)
@@ -293,7 +303,7 @@ def main() -> None:
     scheduler.start()
     log.info("Scheduler started, replan every %d min", cfg.replan_interval_minutes)
 
-    uvicorn.run(app, host="0.0.0.0", port=8099, log_level="warning")
+    server_thread.join()
 
 
 if __name__ == "__main__":
