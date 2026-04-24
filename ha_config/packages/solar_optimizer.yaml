@@ -1,0 +1,104 @@
+###############################################################################
+# Solar Optimizer -- HA-side package
+# Copy this file to /config/packages/solar_optimizer.yaml
+# No changes to configuration.yaml needed (packages auto-loaded).
+###############################################################################
+
+input_number:
+  optimizer_dhw_comfort_min:
+    name: "Optimizer DHW comfort minimum"
+    min: 40
+    max: 55
+    step: 1
+    unit_of_measurement: "°C"
+    icon: mdi:thermometer-water
+
+  optimizer_dhw_max_temp:
+    name: "Optimizer DHW maximum temperature"
+    min: 50
+    max: 65
+    step: 1
+    unit_of_measurement: "°C"
+    icon: mdi:thermometer-high
+
+automation:
+  - alias: "Optimizer: Zabezpieczenie baterii przy niskim SoC"
+    id: optimizer_battery_soc_guard
+    description: "Zatrzymaj wymuszone ladowanie jesli SoC < 10% i optimizer ma aktywne ladowanie"
+    trigger:
+      - platform: numeric_state
+        entity_id: sensor.battery_state_of_capacity
+        below: 10
+    condition:
+      - condition: state
+        entity_id: switch.optimizer_battery_control
+        state: "on"
+    action:
+      - service: mqtt.publish
+        data:
+          topic: "homeassistant/switch/solar_optimizer_battery_control/set"
+          payload: "OFF"
+      - service: notify.family
+        data:
+          title: "Solar Optimizer"
+          message: >
+            Wymuszone ladowanie baterii zatrzymane - SoC spadl ponizej 10%
+            ({{ states('sensor.battery_state_of_capacity') }}%).
+
+  - alias: "Optimizer: Watchdog braku heartbeat"
+    id: optimizer_heartbeat_watchdog
+    description: "Wylacz optimizer jesli nie opublikowal planu przez > 45 minut"
+    trigger:
+      - platform: template
+        value_template: >
+          {% set last = state_attr('sensor.optimizer_status', 'last_run') %}
+          {% if last %}
+            {{ (now() - last | as_datetime).total_seconds() > 2700 }}
+          {% else %}
+            false
+          {% endif %}
+    condition:
+      - condition: state
+        entity_id: switch.optimizer_enabled
+        state: "on"
+    action:
+      - service: mqtt.publish
+        data:
+          topic: "homeassistant/switch/solar_optimizer_enabled/set"
+          payload: "OFF"
+      - service: mqtt.publish
+        data:
+          topic: "homeassistant/switch/solar_optimizer_battery_control/set"
+          payload: "OFF"
+      - service: mqtt.publish
+        data:
+          topic: "homeassistant/switch/solar_optimizer_dhw_control/set"
+          payload: "OFF"
+      - service: mqtt.publish
+        data:
+          topic: "homeassistant/switch/solar_optimizer_ac_control/set"
+          payload: "OFF"
+      - service: notify.family
+        data:
+          title: "Solar Optimizer"
+          message: "Optimizer nie publikowal planu przez > 45 min. Wszystkie przelaczniki wylaczone."
+
+  - alias: "Optimizer: Powiadomienie o nowym planie"
+    id: optimizer_replan_notify
+    description: "Opcjonalne powiadomienie po kazdym przeliczeniu planu"
+    trigger:
+      - platform: state
+        entity_id: sensor.optimizer_status
+    condition:
+      - condition: template
+        value_template: >
+          {{ state_attr('sensor.optimizer_status', 'solver') == 'Optimal' }}
+    action: []
+    # Uncomment to enable notifications:
+    # action:
+    #   - service: notify.family
+    #     data:
+    #       title: "Solar Optimizer"
+    #       message: >
+    #         Nowy plan: PV={{ state_attr('sensor.optimizer_status','pv_forecast_kwh')|round(1) }} kWh,
+    #         load={{ states('sensor.optimizer_load_forecast_kwh') }} kWh

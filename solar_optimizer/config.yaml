@@ -1,0 +1,71 @@
+name: "Solar Optimizer"
+description: "EMHASS-like ML energy optimizer for Huawei solar+battery, heat pump DHW, and Midea AC dispatch"
+version: "0.1.0"
+slug: "solar_optimizer"
+init: false
+arch:
+  - amd64
+  - aarch64
+homeassistant_api: true
+hassio_api: true
+auth_api: false
+ingress: true
+ingress_port: 8099
+panel_icon: "mdi:solar-power-variant"
+panel_title: "Solar Optimizer"
+
+options:
+  ha_url: "http://supervisor/core"
+  influx_host: "192.168.0.105"
+  influx_port: 8086
+  influx_database: "homeassistant"
+  influx_username: "homeassistant"
+  influx_password: ""
+  mqtt_host: "core-mosquitto"
+  mqtt_port: 1883
+  replan_interval_minutes: 30
+  battery_capacity_kwh: 5.0
+  battery_max_charge_power_w: 2500
+  battery_max_discharge_power_w: 2500
+  soc_min_percent: 10
+  soc_max_percent: 95
+  dhw_tank_liters: 200
+  dhw_max_temp: 58
+  dhw_comfort_min: 45
+  dhw_baseline_setpoint: 48
+  dhw_solar_setpoint: 58
+  dhw_restart_dt_default: 5
+  dhw_restart_dt_aggressive: 2
+  dhw_loss_rate_c_per_hour: 0.8
+  dhw_cop: 3.0
+  legionella_hours: 24
+  ml_enabled: true
+  shadow_mode: true
+
+schema:
+  ha_url: str
+  influx_host: str
+  influx_port: int(1024,65535)
+  influx_database: str
+  influx_username: str
+  influx_password: password
+  mqtt_host: str
+  mqtt_port: int(1,65535)
+  replan_interval_minutes: int(5,60)
+  battery_capacity_kwh: float
+  battery_max_charge_power_w: int
+  battery_max_discharge_power_w: int
+  soc_min_percent: int(0,50)
+  soc_max_percent: int(50,100)
+  dhw_tank_liters: int
+  dhw_max_temp: int(50,65)
+  dhw_comfort_min: int(40,55)
+  dhw_baseline_setpoint: int(40,55)
+  dhw_solar_setpoint: int(50,65)
+  dhw_restart_dt_default: int(1,10)
+  dhw_restart_dt_aggressive: int(1,5)
+  dhw_loss_rate_c_per_hour: float
+  dhw_cop: float
+  legionella_hours: int(12,168)
+  ml_enabled: bool
+  shadow_mode: bool
