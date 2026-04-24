@@ -11,7 +11,7 @@ from apscheduler.schedulers.background import BackgroundScheduler
 
 from api import app, set_state
 from config import Config
-from data_pipeline import build_forecast_row
+from data_pipeline import build_forecast_row, build_training_features_ha_stats
 from executor import Executor
 from forecaster import LoadForecaster
 from ha_client import HAClient
@@ -181,6 +181,36 @@ def replan(
             executor.failsafe()
 
 
+def _try_train(cfg: Config, ha: HAClient, influx: InfluxClient, forecaster: LoadForecaster) -> int:
+    """Attempt ML training; return phase (2 if trained, 1 otherwise)."""
+    if not cfg.ml_enabled:
+        return 1
+    if forecaster.is_ready():
+        return 2
+
+    availability = influx.check_data_availability()
+    log.info("InfluxDB data availability: %s", json.dumps(availability))
+    influx_days = min(availability.values(), default=0)
+
+    if influx_days >= 30:
+        log.info("Enough InfluxDB data (%d days) -- training LightGBM", influx_days)
+        if forecaster.train(influx):
+            return 2
+    else:
+        log.info(
+            "InfluxDB only has %d days -- trying HA long-term statistics (up to 365 days)",
+            influx_days,
+        )
+        try:
+            ha_df = build_training_features_ha_stats(ha, days_back=365)
+            if not ha_df.empty and forecaster.train_from_df(ha_df):
+                return 2
+        except Exception as exc:
+            log.warning("HA statistics training failed: %s", exc)
+
+    return 1
+
+
 def main() -> None:
     cfg = Config.load()
     version = _read_addon_version()
@@ -194,20 +224,17 @@ def main() -> None:
 
     mqtt.connect()
 
-    availability = influx.check_data_availability()
-    log.info("InfluxDB data availability: %s", json.dumps(availability))
-
-    phase = 1
-    if cfg.ml_enabled and min(availability.values(), default=0) >= 30:
-        if not forecaster.is_ready():
-            log.info("Enough data for ML -- training LightGBM")
-            if forecaster.train(influx):
-                phase = 2
-        else:
-            phase = 2
+    phase = _try_train(cfg, ha, influx, forecaster)
 
     def _replan():
         replan(cfg, ha, influx, executor, mqtt, forecaster, phase)
+
+    def _retrain():
+        nonlocal phase
+        new_phase = _try_train(cfg, ha, influx, forecaster)
+        if new_phase != phase:
+            log.info("Phase changed %d → %d after retrain", phase, new_phase)
+            phase = new_phase
 
     set_state("replan_fn", _replan)
 
@@ -222,7 +249,7 @@ def main() -> None:
         max_instances=1,
     )
     scheduler.add_job(
-        lambda: forecaster.train(influx) if cfg.ml_enabled else None,
+        _retrain,
         "cron",
         day_of_week="sun",
         hour=3,
