@@ -19,8 +19,6 @@ def build_training_features(influx: InfluxClient, days_back: int = 90) -> pd.Dat
     outdoor = influx.outdoor_temp_30min(days_back=days_back)
     pv = influx.pv_power_30min(days_back=days_back)
 
-    # Outer join: keep all timestamps, resample to a uniform 30-min grid,
-    # then forward-fill gaps up to 4 slots (2 hours)
     df = pd.concat(
         [house, hp, ac_s, ac_p, ac_d, outdoor, pv],
         axis=1,
@@ -29,7 +27,17 @@ def build_training_features(influx: InfluxClient, days_back: int = 90) -> pd.Dat
     df.columns = ["house_kwh", "hp_kwh", "ac_salon_kwh", "ac_pietro_kwh",
                   "ac_poddasze_kwh", "outdoor_temp", "pv_kwh"]
     df = df.resample("30min").mean()
-    df = df.ffill(limit=4).dropna()
+
+    # AC, PV and heatpump are genuinely 0 when not running — fill gaps with 0
+    for col in ["hp_kwh", "ac_salon_kwh", "ac_pietro_kwh", "ac_poddasze_kwh", "pv_kwh"]:
+        df[col] = df[col].fillna(0.0)
+
+    # Forward-fill short outages in critical sensors (up to 2 hours)
+    df["house_kwh"] = df["house_kwh"].ffill(limit=4)
+    df["outdoor_temp"] = df["outdoor_temp"].ffill(limit=8)
+
+    # Only drop rows where critical sensors are still missing
+    df = df.dropna(subset=["house_kwh", "outdoor_temp"])
 
     if df.empty:
         log.warning("Training dataset is empty after join/resample")
