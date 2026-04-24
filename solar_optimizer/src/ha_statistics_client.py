@@ -2,7 +2,7 @@
 
 HA statistics REST API does not exist (WebSocket-only). This module opens
 the DB read-only via sqlite3 (built-in, no extra dependency) using the
-/homeassistant mount added by 'map: homeassistant:ro' in config.yaml.
+/config mount added by 'map: config:ro' in config.yaml.
 """
 import logging
 import sqlite3
@@ -13,7 +13,7 @@ import pandas as pd
 
 log = logging.getLogger(__name__)
 
-HA_DB_PATH = "/homeassistant/home-assistant_v2.db"
+HA_DB_PATH = "/config/home-assistant_v2.db"
 
 
 def get_ha_statistics_30min(

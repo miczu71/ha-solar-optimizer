@@ -1,6 +1,6 @@
 name: "Solar Optimizer"
 description: "EMHASS-like ML energy optimizer for Huawei solar+battery, heat pump DHW, and Midea AC dispatch"
-version: "0.2.0"
+version: "0.2.1"
 slug: "solar_optimizer"
 init: false
 arch:
@@ -14,7 +14,7 @@ ingress_port: 8099
 panel_icon: "mdi:solar-power-variant"
 panel_title: "Solar Optimizer"
 map:
-  - homeassistant:ro
+  - config:ro
 
 options:
   ha_url: "http://supervisor/core"
