@@ -8,12 +8,13 @@ from fastapi.responses import JSONResponse, HTMLResponse
 
 log = logging.getLogger(__name__)
 
-app = FastAPI(title="Solar Optimizer", version="0.2.2")
+app = FastAPI(title="Solar Optimizer")
 
 _state: dict[str, Any] = {
     "last_result": None,
     "last_run": None,
     "phase": 1,
+    "version": "?",
     "replan_fn": None,
 }
 
@@ -27,6 +28,7 @@ async def root() -> HTMLResponse:
     last_run: Optional[datetime] = _state.get("last_run")
     result = _state.get("last_result")
     phase = _state.get("phase", 1)
+    version = _state.get("version", "?")
     phase_label = "Phase 2 &#8212; LightGBM ML" if phase == 2 else "Phase 1 &#8212; Rolling Mean"
     solver_color = "#4ade80" if result and result.status == "Optimal" else "#f87171"
 
@@ -59,7 +61,7 @@ async def root() -> HTMLResponse:
   .sep{{color:#334155;margin:0 6px}}
 </style>
 </head><body>
-<h1>Solar Optimizer <span>v0.2.2</span></h1>
+<h1>Solar Optimizer <span>v{version}</span></h1>
 <div class="badges">
   <span class="badge">&#9679; Shadow Mode</span>
   <span class="badge">{phase_label}</span>
@@ -83,6 +85,7 @@ async def status() -> JSONResponse:
     result = _state.get("last_result")
     return JSONResponse({
         "status": "ok",
+        "version": _state.get("version", "?"),
         "phase": _state.get("phase", 1),
         "last_run": last_run.isoformat() if last_run else None,
         "solver_status": result.status if result else None,

@@ -44,20 +44,29 @@ def _read_addon_version() -> str:
 
 
 def build_pv_forecast(ha: HAClient) -> list[float]:
+    """Parse Solcast detailedForecast into 48-slot kWh array.
+
+    Solcast pv_estimate is in kW (average power for the 30-min interval).
+    Multiply by 0.5 to convert to kWh per slot.
+    Slot indexing uses local time to stay consistent with G12W peak schedule.
+    """
     slots_raw = ha.get_solcast_forecast()
     by_slot: dict[int, float] = {}
-    now = datetime.now(timezone.utc)
+    now_local = datetime.now()  # naive local time for date/slot comparison
     for entry in slots_raw:
         try:
             period_start = entry.get("period_start") or entry.get("PeriodStart") or ""
             if not period_start:
                 continue
             dt = datetime.fromisoformat(period_start.replace("Z", "+00:00"))
-            if dt.date() != now.date():
+            # Normalize to naive local time regardless of whether Solcast returns
+            # UTC (with Z) or local-offset timestamps
+            dt_local = dt.astimezone().replace(tzinfo=None) if dt.tzinfo else dt
+            if dt_local.date() != now_local.date():
                 continue
-            slot = dt.hour * 2 + dt.minute // 30
-            kwh = float(entry.get("pv_estimate", entry.get("PvEstimate", 0)))
-            by_slot[slot] = kwh
+            slot = dt_local.hour * 2 + dt_local.minute // 30
+            kw = float(entry.get("pv_estimate", entry.get("PvEstimate", 0)))
+            by_slot[slot] = kw * 0.5  # kW -> kWh per 30-min slot
         except Exception:
             continue
     return [by_slot.get(s, 0.0) for s in range(48)]
@@ -68,7 +77,7 @@ def build_base_load_forecast(
     forecaster: LoadForecaster,
     ha: HAClient,
     cfg: Config,
-    now: datetime,
+    now_local: datetime,
     phase: int,
 ) -> list[float]:
     if phase == 2 and forecaster.is_ready():
@@ -77,7 +86,7 @@ def build_base_load_forecast(
             rows = [
                 build_forecast_row(
                     slot=s,
-                    now=now,
+                    now=now_local,
                     outdoor_temp=outdoor,
                     lag_1d=0.3,
                     lag_7d=0.3,
@@ -112,9 +121,11 @@ def replan(
             log.info("Optimizer disabled via switch, skipping replan")
             return
 
-        now = datetime.now(timezone.utc)
+        now_utc = datetime.now(timezone.utc)   # for UTC timestamps / logging
+        now_local = datetime.now()              # naive local -- for slot index and G12W peak vector
+
         pv_forecast = build_pv_forecast(ha)
-        base_load = build_base_load_forecast(influx, forecaster, ha, cfg, now, phase)
+        base_load = build_base_load_forecast(influx, forecaster, ha, cfg, now_local, phase)
 
         soc = ha.soc_percent
         soc_min = max(cfg.soc_min_percent, ha.soc_min_from_backup)
@@ -133,7 +144,7 @@ def replan(
             dhw_demand_slots=dhw_demand_slots,
             outdoor_temps=[outdoor] * 48,
             ac_room_temps={u: 22.0 for u in ["salon", "pietro", "poddasze"]},
-            now=now,
+            now=now_local,  # local time -> correct G12W peak window calculation
             enable_battery=mqtt.is_battery_enabled(),
             enable_dhw=mqtt.is_dhw_enabled(),
             enable_ac=mqtt.is_ac_enabled(),
@@ -148,7 +159,7 @@ def replan(
             return
 
         _consecutive_failures = 0
-        slot = now.hour * 2 + now.minute // 30
+        slot = now_local.hour * 2 + now_local.minute // 30  # local slot index
 
         if not cfg.shadow_mode:
             executor.apply_slot(
@@ -162,9 +173,9 @@ def replan(
             log.info("Shadow mode: would apply slot %d DHW=%.3f kWh precharge=%.0f W",
                      slot, result.dhw_heat_energy[slot], result.offpeak_precharge_w[slot])
 
-        mqtt.publish_plan(result, phase=phase, last_run=now)
+        mqtt.publish_plan(result, phase=phase, last_run=now_utc)
         set_state("last_result", result)
-        set_state("last_run", now)
+        set_state("last_run", now_utc)
         set_state("phase", phase)
 
         pv_total = sum(pv_forecast)
@@ -224,8 +235,10 @@ def main() -> None:
     mqtt.connect()
 
     phase = _try_train(cfg, influx, forecaster)
-    # Publish phase immediately so the UI shows the correct mode before the first replan
+    # Publish phase and version immediately so the UI reflects the correct state
+    # before the first replan completes
     set_state("phase", phase)
+    set_state("version", version)
 
     def _replan():
         replan(cfg, ha, influx, executor, mqtt, forecaster, phase)
@@ -234,7 +247,7 @@ def main() -> None:
         nonlocal phase
         new_phase = _try_train(cfg, influx, forecaster)
         if new_phase != phase:
-            log.info("Phase changed %d → %d after retrain", phase, new_phase)
+            log.info("Phase changed %d -> %d after retrain", phase, new_phase)
             phase = new_phase
         set_state("phase", phase)
 
