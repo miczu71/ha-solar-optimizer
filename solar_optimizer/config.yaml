@@ -23,6 +23,8 @@ options:
   influx_password: ""
   mqtt_host: "core-mosquitto"
   mqtt_port: 1883
+  mqtt_username: ""
+  mqtt_password: ""
   replan_interval_minutes: 30
   battery_capacity_kwh: 5.0
   battery_max_charge_power_w: 2500
@@ -51,6 +53,8 @@ schema:
   influx_password: password
   mqtt_host: str
   mqtt_port: int(1,65535)
+  mqtt_username: str?
+  mqtt_password: password?
   replan_interval_minutes: int(5,60)
   battery_capacity_kwh: float
   battery_max_charge_power_w: int

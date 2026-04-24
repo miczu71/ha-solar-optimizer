@@ -22,6 +22,7 @@ SLOTS = 48
 SLOT_HOURS = 0.5
 ETA_CHARGE = 0.95
 ETA_DISCHARGE = 0.95
+INV_ETA_DISCHARGE = 1.0 / ETA_DISCHARGE
 PEAK_PRICE = 1.23
 OFFPEAK_PRICE = 0.63
 
@@ -90,6 +91,9 @@ def run_optimizer(
     bat_max_charge_kwh = cfg.battery_max_charge_power_w / 1000 * SLOT_HOURS
     bat_max_discharge_kwh = cfg.battery_max_discharge_power_w / 1000 * SLOT_HOURS
 
+    inv_dhw_cop = 1.0 / cfg.dhw_cop
+    inv_tm = 1.0 / dhw_model.thermal_mass_kwh_per_c
+
     prob = pulp.LpProblem("solar_optimizer", pulp.LpMinimize)
 
     dhw = [pulp.LpVariable(f"dhw_{t}", lowBound=0) for t in range(SLOTS)]
@@ -139,10 +143,11 @@ def run_optimizer(
         pv = pv_forecast_kwh[t]
         base = base_load_kwh[t]
 
-        dhw_elec = dhw[t] / cfg.dhw_cop if enable_dhw else 0
+        # PuLP does not support LpVariable / float — use multiplication by inverse
+        dhw_elec = dhw[t] * inv_dhw_cop if enable_dhw else 0
 
         ac_elec = pulp.lpSum(
-            ACRoomModel.estimate_power_w(ac[u][t], outdoor_temps[t]) / 1000 * SLOT_HOURS
+            ACRoomModel.estimate_power_w(ac[u][t], outdoor_temps[t]) * (SLOT_HOURS / 1000)
             for u in AC_UNITS
         ) if enable_ac else 0
 
@@ -158,13 +163,13 @@ def run_optimizer(
         prob += soc[t + 1] == (
             soc[t]
             + ETA_CHARGE * (pv_to_bat[t] + (precharge[t] if enable_battery else 0))
-            - bat_to_load[t] / ETA_DISCHARGE
+            - bat_to_load[t] * INV_ETA_DISCHARGE
         )
         prob += pv_to_bat[t] + (precharge[t] if enable_battery else 0) <= bat_max_charge_kwh
 
-        tm = dhw_model.thermal_mass_kwh_per_c
+        dhw_contrib = dhw[t] * inv_tm if enable_dhw else 0
         loss = dhw_model.loss_rate_c_per_hour * SLOT_HOURS
-        prob += dhw_temp[t + 1] == dhw_temp[t] + (dhw[t] if enable_dhw else 0) / tm - loss
+        prob += dhw_temp[t + 1] == dhw_temp[t] + dhw_contrib - loss
 
         if enable_dhw and dhw_demand_slots[t]:
             prob += dhw_temp[t] >= cfg.dhw_comfort_min

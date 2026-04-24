@@ -19,6 +19,8 @@ class Config:
     influx_password: str = ""
     mqtt_host: str = "core-mosquitto"
     mqtt_port: int = 1883
+    mqtt_username: str = ""
+    mqtt_password: str = ""
     replan_interval_minutes: int = 30
     battery_capacity_kwh: float = 5.0
     battery_max_charge_power_w: int = 2500

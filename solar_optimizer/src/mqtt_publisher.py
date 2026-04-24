@@ -80,6 +80,8 @@ class MQTTPublisher:
             client_id=NODE_ID,
             clean_session=True,
         )
+        if cfg.mqtt_username:
+            self._client.username_pw_set(cfg.mqtt_username, cfg.mqtt_password)
         self._client.on_connect = self._on_connect
         self._client.on_message = self._on_message
         self._switch_states: dict[str, bool] = {
@@ -96,6 +98,9 @@ class MQTTPublisher:
         time.sleep(1)
 
     def _on_connect(self, client, userdata, flags, rc) -> None:
+        if rc != 0:
+            log.error("MQTT connection failed rc=%d", rc)
+            return
         log.info("MQTT connected rc=%d", rc)
         self._publish_discovery()
         for key in SWITCH_CONFIGS:

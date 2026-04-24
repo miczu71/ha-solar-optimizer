@@ -27,7 +27,7 @@ class InfluxClient:
         measurement: str,
         field: str = "value",
         days_back: int = 90,
-        resample: str = "30min",
+        resample: str = "30m",
         agg: str = "mean",
     ) -> pd.Series:
         since = (datetime.now(timezone.utc) - timedelta(days=days_back)).isoformat()
