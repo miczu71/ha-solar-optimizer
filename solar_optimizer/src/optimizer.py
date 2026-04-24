@@ -10,7 +10,6 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Optional
 
-import numpy as np
 import pulp
 
 from config import Config
@@ -114,8 +113,10 @@ def run_optimizer(
     bat_to_load = [pulp.LpVariable(f"b2l_{t}", lowBound=0) for t in range(SLOTS)]
     soc = [pulp.LpVariable(f"soc_{t}", lowBound=soc_min_kwh, upBound=soc_max_kwh)
            for t in range(SLOTS + 1)]
-    dhw_temp = [pulp.LpVariable(f"dhwt_{t}", lowBound=cfg.dhw_comfort_min - 5,
-                                 upBound=cfg.dhw_max_temp + 2)
+
+    # Lower bound is 0 so the tank can freely decay when DHW control is disabled
+    # without causing LP infeasibility. Comfort floor constraints are added separately.
+    dhw_temp = [pulp.LpVariable(f"dhwt_{t}", lowBound=0.0, upBound=cfg.dhw_max_temp + 2)
                 for t in range(SLOTS + 1)]
 
     dhw_thrash = [pulp.LpVariable(f"dthr_{t}", lowBound=0) for t in range(1, SLOTS)]

@@ -101,6 +101,9 @@ class InfluxClient:
             "ac_d": ac_d,
         }).fillna(0)
 
+        if not isinstance(combined.index, pd.DatetimeIndex) or combined.empty:
+            raise ValueError("No time-indexed InfluxDB data available for rolling mean")
+
         combined["base"] = (
             combined["house"]
             - combined["hp"]
