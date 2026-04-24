@@ -18,6 +18,7 @@ class HAClient:
             "Authorization": f"Bearer {cfg.ha_token}",
             "Content-Type": "application/json",
         }
+        self._solcast_cache: dict[str, list[dict]] = {}
 
     def get_state(self, entity_id: str) -> dict[str, Any]:
         url = f"{self._base}/api/states/{entity_id}"
@@ -98,6 +99,7 @@ class HAClient:
             return False
 
     def get_solcast_forecast(self) -> list[dict]:
+        """Returns merged today+tomorrow 30-min forecast slots, with per-entity cache fallback."""
         slots: list[dict] = []
         for entity in (
             "sensor.solcast_pv_forecast_forecast_today",
@@ -106,9 +108,17 @@ class HAClient:
             try:
                 state = self.get_state(entity)
                 detailed = state.get("attributes", {}).get("detailedForecast", [])
-                slots.extend(detailed)
+                if detailed:
+                    self._solcast_cache[entity] = detailed
+                    slots.extend(detailed)
+                elif entity in self._solcast_cache:
+                    log.info("Solcast %s returned empty; using cache (%d slots)", entity, len(self._solcast_cache[entity]))
+                    slots.extend(self._solcast_cache[entity])
             except Exception as exc:
                 log.warning("Solcast fetch failed for %s: %s", entity, exc)
+                if entity in self._solcast_cache:
+                    log.info("Using cached Solcast data for %s (%d slots)", entity, len(self._solcast_cache[entity]))
+                    slots.extend(self._solcast_cache[entity])
         return slots
 
     def set_dhw_setpoint(self, value: float) -> None:
