@@ -29,6 +29,8 @@ log = logging.getLogger("main")
 
 CONSECUTIVE_FAILURE_LIMIT = 3
 _consecutive_failures = 0
+_HISTORY_FILE = "/data/plan_history.jsonl"
+_HISTORY_MAX_RECORDS = 1440  # ~30 days at 48 replans/day
 
 
 def _read_addon_version() -> str:
@@ -105,6 +107,35 @@ def build_base_load_forecast(
         return [0.3] * 48
 
 
+def _save_daily_summary(result: OptimizeResult, now_local: datetime, phase: int) -> None:
+    """Append a per-replan record to plan_history.jsonl for the history tab."""
+    try:
+        pv_total = sum(result.pv_forecast_kwh) if result.pv_forecast_kwh else result.pv_forecast_kwh_total
+        export_total = sum(result.grid_export_kwh)
+        import_total = sum(result.grid_import_kwh)
+        self_cons = max(0.0, (pv_total - export_total) / pv_total * 100) if pv_total > 0 else 0.0
+        record = {
+            "date": now_local.strftime("%Y-%m-%d"),
+            "time": now_local.isoformat(),
+            "phase": phase,
+            "pv_total_kwh": round(pv_total, 3),
+            "load_total_kwh": round(result.load_forecast_kwh_total, 3),
+            "grid_import_total_kwh": round(import_total, 3),
+            "grid_export_total_kwh": round(export_total, 3),
+            "self_cons_pct": round(self_cons, 1),
+        }
+        with open(_HISTORY_FILE, "a") as f:
+            f.write(json.dumps(record) + "\n")
+        # Trim to keep only the most recent records
+        with open(_HISTORY_FILE) as f:
+            lines = f.readlines()
+        if len(lines) > _HISTORY_MAX_RECORDS:
+            with open(_HISTORY_FILE, "w") as f:
+                f.writelines(lines[-_HISTORY_MAX_RECORDS:])
+    except Exception as exc:
+        log.warning("Failed to save plan history: %s", exc)
+
+
 def replan(
     cfg: Config,
     ha: HAClient,
@@ -143,7 +174,7 @@ def replan(
             dhw_demand_slots=dhw_demand_slots,
             outdoor_temps=[outdoor] * 48,
             ac_room_temps={u: 22.0 for u in ["salon", "pietro", "poddasze"]},
-            now=now_local,  # local time -> correct G12W weekday and peak window
+            now=now_local,
             enable_battery=mqtt.is_battery_enabled(),
             enable_dhw=mqtt.is_dhw_enabled(),
             enable_ac=mqtt.is_ac_enabled(),
@@ -158,7 +189,7 @@ def replan(
             return
 
         _consecutive_failures = 0
-        slot = now_local.hour * 2 + now_local.minute // 30  # local slot index
+        slot = now_local.hour * 2 + now_local.minute // 30
 
         if not cfg.shadow_mode:
             executor.apply_slot(
@@ -181,6 +212,8 @@ def replan(
         if pv_total > 0:
             self_cons = max(0.0, (pv_total - sum(result.grid_export_kwh)) / pv_total * 100)
             mqtt.publish_self_consumption(self_cons)
+
+        _save_daily_summary(result, now_local, phase)
 
     except Exception as exc:
         log.error("Replan error: %s", exc, exc_info=True)
@@ -226,7 +259,7 @@ def main() -> None:
     log.info("Starting Solar Optimizer v%s shadow_mode=%s", version, cfg.shadow_mode)
 
     ha = HAClient(cfg)
-    ha.init_timezone()  # read HA timezone before any local-time calculations
+    ha.init_timezone()
 
     influx = InfluxClient(cfg)
     forecaster = LoadForecaster()
@@ -255,20 +288,8 @@ def main() -> None:
     _replan()
 
     scheduler = BackgroundScheduler()
-    scheduler.add_job(
-        _replan,
-        "interval",
-        minutes=cfg.replan_interval_minutes,
-        id="replan",
-        max_instances=1,
-    )
-    scheduler.add_job(
-        _retrain,
-        "cron",
-        day_of_week="sun",
-        hour=3,
-        id="retrain",
-    )
+    scheduler.add_job(_replan, "interval", minutes=cfg.replan_interval_minutes, id="replan", max_instances=1)
+    scheduler.add_job(_retrain, "cron", day_of_week="sun", hour=3, id="retrain")
     scheduler.start()
     log.info("Scheduler started, replan every %d min", cfg.replan_interval_minutes)
 

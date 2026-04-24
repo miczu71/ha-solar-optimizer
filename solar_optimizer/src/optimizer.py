@@ -52,6 +52,10 @@ class OptimizeResult:
     dhw_temp_trajectory: list[float] = field(default_factory=list)
     grid_import_kwh: list[float] = field(default_factory=list)
     grid_export_kwh: list[float] = field(default_factory=list)
+    # Per-slot inputs stored for UI/history use
+    pv_forecast_kwh: list[float] = field(default_factory=list)
+    base_load_kwh: list[float] = field(default_factory=list)
+    is_peak: list[bool] = field(default_factory=list)
     objective_value: Optional[float] = None
     pv_forecast_kwh_total: float = 0.0
     load_forecast_kwh_total: float = 0.0
@@ -95,7 +99,7 @@ def run_optimizer(
 
     # Clamp initial conditions to LP variable bounds.
     # The real battery can momentarily exceed soc_max (PV overcharge) or dip below
-    # soc_min (backup reserve not yet enforced) — clamping prevents LP infeasibility.
+    # soc_min (backup reserve not yet enforced) -- clamping prevents LP infeasibility.
     soc_init_kwh = min(soc_max_kwh, max(soc_min_kwh, soc_init * bat_cap_kwh / 100))
     raw_soc_kwh = soc_init * bat_cap_kwh / 100
     if abs(soc_init_kwh - raw_soc_kwh) > 0.05:
@@ -223,6 +227,9 @@ def run_optimizer(
         dhw_temp_trajectory=[v(dhw_temp[t]) for t in range(SLOTS + 1)],
         grid_import_kwh=[v(grid_import[t]) for t in range(SLOTS)],
         grid_export_kwh=[v(grid_export[t]) for t in range(SLOTS)],
+        pv_forecast_kwh=list(pv_forecast_kwh),
+        base_load_kwh=list(base_load_kwh),
+        is_peak=list(is_peak),
         objective_value=pulp.value(prob.objective),
         pv_forecast_kwh_total=sum(pv_forecast_kwh),
         load_forecast_kwh_total=sum(base_load_kwh),
