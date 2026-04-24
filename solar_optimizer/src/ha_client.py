@@ -1,6 +1,8 @@
 """HA REST API wrapper with sign-convention normalization."""
 import logging
+from datetime import datetime
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import httpx
 
@@ -19,6 +21,23 @@ class HAClient:
             "Content-Type": "application/json",
         }
         self._solcast_cache: dict[str, list[dict]] = {}
+        self.tz: ZoneInfo = ZoneInfo("UTC")  # updated by init_timezone()
+
+    def init_timezone(self) -> None:
+        """Read HA's configured timezone from /api/config. Call once at startup."""
+        try:
+            r = httpx.get(f"{self._base}/api/config", headers=self._headers, timeout=TIMEOUT)
+            r.raise_for_status()
+            tz_str = r.json().get("time_zone", "UTC")
+            self.tz = ZoneInfo(tz_str)
+            log.info("HA timezone: %s", tz_str)
+        except Exception as exc:
+            log.warning("Could not read HA timezone, defaulting to UTC: %s", exc)
+
+    @property
+    def local_now(self) -> datetime:
+        """Current time in HA's configured timezone."""
+        return datetime.now(tz=self.tz)
 
     def get_state(self, entity_id: str) -> dict[str, Any]:
         url = f"{self._base}/api/states/{entity_id}"

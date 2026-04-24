@@ -48,20 +48,19 @@ def build_pv_forecast(ha: HAClient) -> list[float]:
 
     Solcast pv_estimate is in kW (average power for the 30-min interval).
     Multiply by 0.5 to convert to kWh per slot.
-    Slot indexing uses local time to stay consistent with G12W peak schedule.
+    Slot indexing and date filtering use HA's local timezone.
     """
     slots_raw = ha.get_solcast_forecast()
     by_slot: dict[int, float] = {}
-    now_local = datetime.now()  # naive local time for date/slot comparison
+    now_local = ha.local_now
     for entry in slots_raw:
         try:
             period_start = entry.get("period_start") or entry.get("PeriodStart") or ""
             if not period_start:
                 continue
             dt = datetime.fromisoformat(period_start.replace("Z", "+00:00"))
-            # Normalize to naive local time regardless of whether Solcast returns
-            # UTC (with Z) or local-offset timestamps
-            dt_local = dt.astimezone().replace(tzinfo=None) if dt.tzinfo else dt
+            # Normalize to HA local timezone; if naive, assume it's already local
+            dt_local = dt.astimezone(ha.tz) if dt.tzinfo else dt.replace(tzinfo=ha.tz)
             if dt_local.date() != now_local.date():
                 continue
             slot = dt_local.hour * 2 + dt_local.minute // 30
@@ -121,8 +120,8 @@ def replan(
             log.info("Optimizer disabled via switch, skipping replan")
             return
 
-        now_utc = datetime.now(timezone.utc)   # for UTC timestamps / logging
-        now_local = datetime.now()              # naive local -- for slot index and G12W peak vector
+        now_utc = datetime.now(timezone.utc)   # UTC for timestamps / logging
+        now_local = ha.local_now               # HA local time for slots and G12W peak vector
 
         pv_forecast = build_pv_forecast(ha)
         base_load = build_base_load_forecast(influx, forecaster, ha, cfg, now_local, phase)
@@ -144,7 +143,7 @@ def replan(
             dhw_demand_slots=dhw_demand_slots,
             outdoor_temps=[outdoor] * 48,
             ac_room_temps={u: 22.0 for u in ["salon", "pietro", "poddasze"]},
-            now=now_local,  # local time -> correct G12W peak window calculation
+            now=now_local,  # local time -> correct G12W weekday and peak window
             enable_battery=mqtt.is_battery_enabled(),
             enable_dhw=mqtt.is_dhw_enabled(),
             enable_ac=mqtt.is_ac_enabled(),
@@ -227,6 +226,8 @@ def main() -> None:
     log.info("Starting Solar Optimizer v%s shadow_mode=%s", version, cfg.shadow_mode)
 
     ha = HAClient(cfg)
+    ha.init_timezone()  # read HA timezone before any local-time calculations
+
     influx = InfluxClient(cfg)
     forecaster = LoadForecaster()
     mqtt = MQTTPublisher(cfg)
@@ -235,8 +236,6 @@ def main() -> None:
     mqtt.connect()
 
     phase = _try_train(cfg, influx, forecaster)
-    # Publish phase and version immediately so the UI reflects the correct state
-    # before the first replan completes
     set_state("phase", phase)
     set_state("version", version)
 
