@@ -76,7 +76,7 @@ class HAClient:
 
     @property
     def dhw_tank_temp(self) -> float:
-        return self.get_state_value("sensor.heiko_hot_water_dhw_temperature", default=45.0)
+        return self.get_state_value("sensor.heiko_heat_pump_water_temperature", default=45.0)
 
     @property
     def dhw_setpoint(self) -> float:
