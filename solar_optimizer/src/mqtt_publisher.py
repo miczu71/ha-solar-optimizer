@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 import paho.mqtt.client as mqtt
+from paho.mqtt.enums import CallbackAPIVersion
 
 from config import Config
 from optimizer import OptimizeResult
@@ -74,7 +75,11 @@ SWITCH_CONFIGS = {
 class MQTTPublisher:
     def __init__(self, cfg: Config) -> None:
         self._cfg = cfg
-        self._client = mqtt.Client(client_id=NODE_ID, clean_session=True)
+        self._client = mqtt.Client(
+            callback_api_version=CallbackAPIVersion.VERSION1,
+            client_id=NODE_ID,
+            clean_session=True,
+        )
         self._client.on_connect = self._on_connect
         self._client.on_message = self._on_message
         self._switch_states: dict[str, bool] = {
