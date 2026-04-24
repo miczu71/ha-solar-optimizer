@@ -113,6 +113,7 @@ class InfluxClient:
         return combined.groupby("slot")["base"].mean()
 
     def check_data_availability(self) -> dict[str, int]:
+        """Return number of days (out of last 90) that have at least one data point."""
         sensors = {
             "house": ("W", "house_consumption_power"),
             "heatpump": ("W", "heiko_heat_pump_electrical_power"),
@@ -122,14 +123,15 @@ class InfluxClient:
         for key, (meas, eid) in sensors.items():
             q = (
                 f'SELECT count("value") FROM "{meas}" '
-                f"WHERE \"entity_id\" = '{eid}' AND time >= now() - 90d"
+                f"WHERE \"entity_id\" = '{eid}' AND time >= now() - 90d "
+                f"GROUP BY time(1d) fill(0)"
             )
             try:
                 res = self._client.query(q)
                 if res:
                     df = list(res.values())[0]
-                    count = int(df.iloc[0, 0]) if not df.empty else 0
-                    result[key] = count // 48
+                    # Count days that have at least one record
+                    result[key] = int((df.iloc[:, 0] > 0).sum())
                 else:
                     result[key] = 0
             except Exception as exc:
