@@ -23,6 +23,12 @@ def set_state(key: str, value: Any) -> None:
     _state[key] = value
 
 
+# All fetch() calls and href links use RELATIVE paths (no leading slash).
+# When served through HA ingress the page URL is:
+#   https://ha:8123/api/hassio_ingress/{token}/
+# Absolute paths like /status resolve to https://ha:8123/status (HA frontend).
+# Relative paths like 'status' resolve to .../api/hassio_ingress/{token}/status
+# which the supervisor proxy correctly forwards to the add-on.
 _DASHBOARD_HTML = """\
 <!DOCTYPE html>
 <html lang="en">
@@ -70,7 +76,7 @@ a{color:var(--bl);text-decoration:none}a:hover{text-decoration:underline}
 </div>
 
 <div id="panel-status" class="panel active">
-  <div id="st-wrap"><p class="msg">&#8987; Connecting to server&hellip;</p></div>
+  <div id="st-wrap"><p class="msg">&#8987; Connecting&hellip;</p></div>
 </div>
 
 <div id="panel-plan" class="panel">
@@ -112,8 +118,8 @@ a{color:var(--bl);text-decoration:none}a:hover{text-decoration:underline}
 </div>
 
 <div class="links">
-  <a href="/status">JSON status</a><span class="sep">|</span>
-  <a href="/schedule">JSON schedule</a><span class="sep">|</span>
+  <a href="status">JSON status</a><span class="sep">|</span>
+  <a href="schedule">JSON schedule</a><span class="sep">|</span>
   <a href="#" onclick="triggerReplan();return false">Force replan</a>
 </div>
 
@@ -135,8 +141,11 @@ function showTab(n,b){
 
 async function loadStatus(){
   try{
-    const d=await fetch('/status').then(r=>r.json());
-    // Server is responding — cancel startup retry timer
+    // Relative path: resolves correctly both at direct port and via HA ingress proxy
+    const d=await fetch('status').then(r=>{
+      if(!r.ok)throw new Error('HTTP '+r.status);
+      return r.json();
+    });
     if(_retryTimer){clearInterval(_retryTimer);_retryTimer=null;}
     document.getElementById('ver').textContent='v'+(d.version||'?');
     document.getElementById('phase-b').textContent=d.phase===2?'Phase 2 — LightGBM ML':'Phase 1 — Rolling Mean';
@@ -157,7 +166,7 @@ async function loadStatus(){
 
 async function loadPlan(){
   try{
-    const d=await fetch('/schedule').then(r=>r.json());
+    const d=await fetch('schedule').then(r=>r.json());
     if(!d.slots||!d.slots.length){
       document.getElementById('plan-msg').innerHTML='<p class="msg">No plan yet — waiting for first replan</p>';
       return;
@@ -213,7 +222,7 @@ async function loadPlan(){
     const rows=document.getElementById('pt').querySelectorAll('tr');
     if(rows[cur])rows[cur].scrollIntoView({block:'center'});
   }catch(e){
-    document.getElementById('plan-msg').innerHTML='<p class="msg">&#8987; Server starting up — try again in a moment</p>';
+    document.getElementById('plan-msg').innerHTML='<p class="msg">&#8987; Waiting for first replan…</p>';
     planLoaded=false;
     console.error('Plan load error:',e);
   }
@@ -222,7 +231,7 @@ async function loadPlan(){
 async function loadHistory(){
   histLoaded=true;
   try{
-    const data=await fetch('/history').then(r=>r.json());
+    const data=await fetch('history').then(r=>r.json());
     if(!data.length){
       document.getElementById('ht').innerHTML='<tr><td colspan=6 style="color:#94a3b8">No history yet — accumulates after first day</td></tr>';return;
     }
@@ -237,12 +246,12 @@ async function loadHistory(){
     }).join('');
   }catch(e){
     document.getElementById('ht').innerHTML='<tr><td colspan=6 style="color:#94a3b8">&#8987; Server starting up — click History again in a moment</td></tr>';
-    histLoaded=false;  // allow retry on next tab click
+    histLoaded=false;
   }
 }
 
 async function triggerReplan(){
-  await fetch('/force-replan',{method:'POST'}).catch(()=>{});
+  await fetch('force-replan',{method:'POST'}).catch(()=>{});
   setTimeout(()=>{loadStatus();planLoaded=false;},3000);
   setTimeout(()=>{if(document.getElementById('panel-plan').classList.contains('active'))loadPlan();},3500);
 }
