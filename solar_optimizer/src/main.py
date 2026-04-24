@@ -1,6 +1,7 @@
 """Entrypoint: initializes all subsystems, starts APScheduler and FastAPI."""
 import json
 import logging
+import re
 import sys
 from datetime import datetime, timezone
 from typing import Optional
@@ -28,6 +29,18 @@ log = logging.getLogger("main")
 
 CONSECUTIVE_FAILURE_LIMIT = 3
 _consecutive_failures = 0
+
+
+def _read_addon_version() -> str:
+    try:
+        with open("/app/addon_config.yaml") as f:
+            for line in f:
+                m = re.match(r'^version:\s*["\']?([^"\'\s]+)["\']?', line)
+                if m:
+                    return m.group(1)
+    except Exception:
+        pass
+    return "unknown"
 
 
 def build_pv_forecast(ha: HAClient) -> list[float]:
@@ -170,7 +183,8 @@ def replan(
 
 def main() -> None:
     cfg = Config.load()
-    log.info("Starting Solar Optimizer v0.1.0 shadow_mode=%s", cfg.shadow_mode)
+    version = _read_addon_version()
+    log.info("Starting Solar Optimizer v%s shadow_mode=%s", version, cfg.shadow_mode)
 
     ha = HAClient(cfg)
     influx = InfluxClient(cfg)

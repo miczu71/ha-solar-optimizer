@@ -1,6 +1,6 @@
 name: "Solar Optimizer"
 description: "EMHASS-like ML energy optimizer for Huawei solar+battery, heat pump DHW, and Midea AC dispatch"
-version: "0.1.6"
+version: "0.1.7"
 slug: "solar_optimizer"
 init: false
 arch:
