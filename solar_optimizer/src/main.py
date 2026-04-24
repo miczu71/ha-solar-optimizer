@@ -35,7 +35,7 @@ def _read_addon_version() -> str:
     try:
         with open("/app/addon_config.yaml") as f:
             for line in f:
-                m = re.match(r'^version:\s*["\']?([^"\'\s]+)["\']?', line)
+                m = re.match(r'^version:\s*["\']?([^"\'\ s]+)["\']?', line)
                 if m:
                     return m.group(1)
     except Exception:
@@ -224,6 +224,8 @@ def main() -> None:
     mqtt.connect()
 
     phase = _try_train(cfg, influx, forecaster)
+    # Publish phase immediately so the UI shows the correct mode before the first replan
+    set_state("phase", phase)
 
     def _replan():
         replan(cfg, ha, influx, executor, mqtt, forecaster, phase)
@@ -234,6 +236,7 @@ def main() -> None:
         if new_phase != phase:
             log.info("Phase changed %d → %d after retrain", phase, new_phase)
             phase = new_phase
+        set_state("phase", phase)
 
     set_state("replan_fn", _replan)
 

@@ -93,6 +93,19 @@ def run_optimizer(
     inv_dhw_cop = 1.0 / cfg.dhw_cop
     inv_tm = 1.0 / dhw_model.thermal_mass_kwh_per_c
 
+    # Clamp initial conditions to LP variable bounds.
+    # The real battery can momentarily exceed soc_max (PV overcharge) or dip below
+    # soc_min (backup reserve not yet enforced) — clamping prevents LP infeasibility.
+    soc_init_kwh = min(soc_max_kwh, max(soc_min_kwh, soc_init * bat_cap_kwh / 100))
+    raw_soc_kwh = soc_init * bat_cap_kwh / 100
+    if abs(soc_init_kwh - raw_soc_kwh) > 0.05:
+        log.warning(
+            "SoC %.1f%% (%.3f kWh) outside LP bounds [%.1f%%, %.1f%%] -- clamped to %.3f kWh",
+            soc_init, raw_soc_kwh, cfg.soc_min_percent, cfg.soc_max_percent, soc_init_kwh,
+        )
+
+    dhw_temp_init_clamped = max(0.0, min(cfg.dhw_max_temp + 2, dhw_temp_init))
+
     prob = pulp.LpProblem("solar_optimizer", pulp.LpMinimize)
 
     dhw = [pulp.LpVariable(f"dhw_{t}", lowBound=0) for t in range(SLOTS)]
@@ -137,14 +150,14 @@ def run_optimizer(
         )
     )
 
-    prob += soc[0] == soc_init * bat_cap_kwh / 100
-    prob += dhw_temp[0] == dhw_temp_init
+    prob += soc[0] == soc_init_kwh
+    prob += dhw_temp[0] == dhw_temp_init_clamped
 
     for t in range(SLOTS):
         pv = pv_forecast_kwh[t]
         base = base_load_kwh[t]
 
-        # PuLP does not support LpVariable / float — use multiplication by inverse
+        # PuLP does not support LpVariable / float -- use multiplication by inverse
         dhw_elec = dhw[t] * inv_dhw_cop if enable_dhw else 0
 
         ac_elec = pulp.lpSum(
