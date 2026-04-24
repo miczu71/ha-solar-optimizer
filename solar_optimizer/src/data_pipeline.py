@@ -19,24 +19,28 @@ def build_training_features(influx: InfluxClient, days_back: int = 90) -> pd.Dat
     outdoor = influx.outdoor_temp_30min(days_back=days_back)
     pv = influx.pv_power_30min(days_back=days_back)
 
-    df = pd.DataFrame({
-        "house_kwh": house,
-        "hp_kwh": hp,
-        "ac_salon_kwh": ac_s,
-        "ac_pietro_kwh": ac_p,
-        "ac_poddasze_kwh": ac_d,
-        "outdoor_temp": outdoor,
-        "pv_kwh": pv,
-    }).fillna(method="ffill", limit=4).dropna()
+    # Outer join: keep all timestamps, resample to a uniform 30-min grid,
+    # then forward-fill gaps up to 4 slots (2 hours)
+    df = pd.concat(
+        [house, hp, ac_s, ac_p, ac_d, outdoor, pv],
+        axis=1,
+        join="outer",
+    )
+    df.columns = ["house_kwh", "hp_kwh", "ac_salon_kwh", "ac_pietro_kwh",
+                  "ac_poddasze_kwh", "outdoor_temp", "pv_kwh"]
+    df = df.resample("30min").mean()
+    df = df.ffill(limit=4).dropna()
+
+    if df.empty:
+        log.warning("Training dataset is empty after join/resample")
+        return df
 
     df["base_load_kwh"] = (
         df["house_kwh"] - df["hp_kwh"] - df["ac_salon_kwh"]
         - df["ac_pietro_kwh"] - df["ac_poddasze_kwh"]
     ).clip(lower=0)
 
-    df["hour"] = df.index.hour
-    df["minute"] = df.index.minute
-    df["slot"] = df["hour"] * 2 + df["minute"] // 30
+    df["slot"] = df.index.hour * 2 + df.index.minute // 30
     df["day_of_week"] = df.index.dayofweek
     df["month"] = df.index.month
     df["is_weekend"] = (df["day_of_week"] >= 5).astype(int)
@@ -44,12 +48,12 @@ def build_training_features(influx: InfluxClient, days_back: int = 90) -> pd.Dat
     df["lag_1d"] = df["base_load_kwh"].shift(48)
     df["lag_7d"] = df["base_load_kwh"].shift(48 * 7)
 
-    daily_pv = pv.resample("1D").sum()
+    daily_pv = df["pv_kwh"].resample("1D").sum()
     df["pv_yesterday_kwh"] = df.index.normalize().map(
         lambda d: daily_pv.get(d - pd.Timedelta(days=1), np.nan)
     )
 
-    df = df.dropna(subset=["lag_1d", "lag_7d"])
+    df = df.dropna(subset=["lag_1d", "lag_7d", "pv_yesterday_kwh"])
     log.info("Training dataset: %d rows spanning %d days", len(df), days_back)
     return df
 
