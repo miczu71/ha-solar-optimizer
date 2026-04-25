@@ -155,7 +155,7 @@ def run_optimizer(
         base = base_load_kwh[t]
 
         # DHW electrical demand
-        dhw_elec = dhw[t] / cfg.dhw_cop if enable_dhw else 0
+        dhw_elec = (1.0 / cfg.dhw_cop) * dhw[t] if enable_dhw else 0
 
         # AC electrical demand
         ac_elec = pulp.lpSum(
@@ -178,14 +178,14 @@ def run_optimizer(
         prob += soc[t + 1] == (
             soc[t]
             + ETA_CHARGE * (pv_to_bat[t] + (precharge[t] if enable_battery else 0))
-            - bat_to_load[t] / ETA_DISCHARGE
+            - (1.0 / ETA_DISCHARGE) * bat_to_load[t]
         )
         prob += pv_to_bat[t] + (precharge[t] if enable_battery else 0) <= bat_max_charge_kwh
 
         # DHW tank temperature dynamics
         tm = dhw_model.thermal_mass_kwh_per_c
         loss = dhw_model.loss_rate_c_per_hour * SLOT_HOURS
-        prob += dhw_temp[t + 1] == dhw_temp[t] + (dhw[t] if enable_dhw else 0) / tm - loss
+        prob += dhw_temp[t + 1] == dhw_temp[t] + ((1.0 / tm) * dhw[t] if enable_dhw else 0) - loss
 
         # DHW comfort floor at demand slots
         if enable_dhw and dhw_demand_slots[t]:

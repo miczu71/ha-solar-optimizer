@@ -5,6 +5,20 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [0.3.2] — 2026-04-25
+
+### Fixed
+- **PuLP division crash** — `LpVariable / float` raises `TypeError` in the PuLP version
+  installed in the Docker image. All three occurrences replaced with the equivalent
+  `(1.0 / constant) * LpVariable` form that uses `LpVariable.__rmul__`:
+  - Battery SoC dynamics: `bat_to_load[t] / ETA_DISCHARGE`
+  - DHW electrical demand: `dhw[t] / cfg.dhw_cop`
+  - DHW tank temperature: `dhw[t] / tm`
+  Previously every replan failed with `TypeError: unsupported operand type(s) for /:
+  'LpVariable' and 'float'` and the optimizer returned no schedule.
+
+---
+
 ## [0.3.1] — 2026-04-25
 
 ### Added
