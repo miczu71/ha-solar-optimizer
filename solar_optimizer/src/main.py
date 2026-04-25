@@ -38,7 +38,7 @@ def _read_addon_version() -> str:
     try:
         with open("/app/addon_config.yaml") as f:
             for line in f:
-                m = re.match(r'^version:\s*["\']?([^"\'\ \\s]+)["\']?', line)
+                m = re.match(r'^version:\s*["\']?([^"\'\\s]+)["\']?', line)
                 if m:
                     return m.group(1)
     except Exception:
@@ -310,6 +310,7 @@ def main() -> None:
     phase = _try_train(cfg, influx, forecaster)
     set_state("phase", phase)
     set_state("version", version)
+    set_state("cfg", cfg)
 
     def _replan():
         replan(cfg, ha, influx, executor, mqtt, forecaster, phase)

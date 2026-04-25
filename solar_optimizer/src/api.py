@@ -15,6 +15,7 @@ _state: dict[str, Any] = {
     "last_run": None,
     "phase": 1,
     "version": "?",
+    "cfg": None,
     "replan_fn": None,
 }
 
@@ -61,12 +62,15 @@ a{color:var(--bl);text-decoration:none}a:hover{text-decoration:underline}
 .legend{display:flex;flex-wrap:wrap;gap:12px;margin-bottom:8px;font-size:.76em}
 .dot{display:inline-block;width:10px;height:10px;border-radius:2px;margin-right:4px}
 .msg{color:var(--m);font-size:.84em;padding:12px 0}
+details{margin-top:14px}
+details summary{cursor:pointer;color:var(--bl);font-size:.82em;user-select:none;padding:4px 0}
+details summary:hover{color:var(--t)}
 </style>
 </head>
 <body>
 <h1>Solar Optimizer <span id="ver"></span></h1>
 <div class="badges">
-  <span class="badge">&#9679; Shadow Mode</span>
+  <span class="badge" id="mode-b">&#9679; Shadow Mode</span>
   <span class="badge" id="phase-b"></span>
 </div>
 <div class="tabs">
@@ -77,6 +81,10 @@ a{color:var(--bl);text-decoration:none}a:hover{text-decoration:underline}
 
 <div id="panel-status" class="panel active">
   <div id="st-wrap"><p class="msg">&#8987; Connecting&hellip;</p></div>
+  <details id="assumptions-details">
+    <summary>&#9432; System assumptions &amp; objective</summary>
+    <div id="assumptions-wrap"></div>
+  </details>
 </div>
 
 <div id="panel-plan" class="panel">
@@ -141,7 +149,6 @@ function showTab(n,b){
 
 async function loadStatus(){
   try{
-    // Relative path: resolves correctly both at direct port and via HA ingress proxy
     const d=await fetch('status').then(r=>{
       if(!r.ok)throw new Error('HTTP '+r.status);
       return r.json();
@@ -149,6 +156,11 @@ async function loadStatus(){
     if(_retryTimer){clearInterval(_retryTimer);_retryTimer=null;}
     document.getElementById('ver').textContent='v'+(d.version||'?');
     document.getElementById('phase-b').textContent=d.phase===2?'Phase 2 — LightGBM ML':'Phase 1 — Rolling Mean';
+    if(d.cfg){
+      const mb=document.getElementById('mode-b');
+      mb.textContent=d.cfg.shadow_mode?'● Shadow Mode':'● Live Mode';
+      mb.style.color=d.cfg.shadow_mode?'#fbbf24':'#4ade80';
+    }
     const sc=d.solver_status==='Optimal'?'#4ade80':'#f87171';
     const rows=[
       ['Last replan',d.last_run?new Date(d.last_run).toLocaleString():'—'],
@@ -158,10 +170,38 @@ async function loadStatus(){
       ['Load forecast today',d.load_forecast_kwh!=null?d.load_forecast_kwh.toFixed(2)+' kWh':'—'],
     ];
     document.getElementById('st-wrap').innerHTML='<table><tbody>'+rows.map(([k,v])=>`<tr><td style="color:#94a3b8;width:55%">${k}</td><td>${v}</td></tr>`).join('')+'</tbody></table>';
+    if(d.cfg)renderAssumptions(d);
   }catch(e){
     document.getElementById('st-wrap').innerHTML='<p class="msg">&#8987; Starting up… retrying in 5 s</p>';
     if(!_retryTimer){_retryTimer=setInterval(loadStatus,5000);}
   }
+}
+
+function renderAssumptions(d){
+  const c=d.cfg;
+  const modeStr=c.shadow_mode
+    ?'<span style="color:#fbbf24">Shadow — optimizer runs, no service calls sent to HA</span>'
+    :'<span style="color:#4ade80">Live — service calls active</span>';
+  const phaseStr=d.phase===2
+    ?'Phase 2 — LightGBM ML (trained on historical load data)'
+    :'Phase 1 — rolling mean of last 7 days (ML not yet trained)';
+  const rows=[
+    ['Mode',modeStr],
+    ['Load forecast',phaseStr],
+    ['PV source','Solcast detailedForecast (30-min slots &times; 0.5 = kWh)'],
+    ['Planning horizon','24 h · 48 × 30-min slots starting at midnight'],
+    ['Battery',`${c.battery_capacity_kwh} kWh · SoC ${c.soc_min_percent}–${c.soc_max_percent}%`],
+    ['G12W peak hours','Mon–Fri 06:00–13:00 &amp; 15:00–22:00 — 1.23 PLN/kWh'],
+    ['G12W off-peak hours','All other hours (incl. weekends) — 0.63 PLN/kWh'],
+    ['Objective',`&#8595; grid import ×1.0 + &#8595; peak cost ×0.3 + &#8595; DHW thrash ×0.05 + &#8595; bat wear ×0.02 − &#8593; SoC@midnight ×0.15`],
+    ['Why SoC@midnight?','Rewards topping up battery before overnight discharge (base load drains 3–5 kWh nightly)'],
+    ['DHW tank',`${c.dhw_tank_liters} L · comfort ${c.dhw_comfort_min}–${c.dhw_max_temp}°C · COP ${c.dhw_cop}`],
+    ['Replan interval',`every ${c.replan_interval_minutes} min`],
+  ];
+  document.getElementById('assumptions-wrap').innerHTML=
+    '<table><tbody>'+
+    rows.map(([k,v])=>`<tr><td style="color:#94a3b8;width:42%;padding:4px 8px">${k}</td><td style="padding:4px 8px">${v}</td></tr>`).join('')+
+    '</tbody></table>';
 }
 
 async function loadPlan(){
@@ -272,6 +312,21 @@ async def root() -> HTMLResponse:
 async def status() -> JSONResponse:
     last_run: Optional[datetime] = _state.get("last_run")
     result = _state.get("last_result")
+    cfg = _state.get("cfg")
+    cfg_data = None
+    if cfg is not None:
+        cfg_data = {
+            "shadow_mode": cfg.shadow_mode,
+            "battery_capacity_kwh": cfg.battery_capacity_kwh,
+            "soc_min_percent": cfg.soc_min_percent,
+            "soc_max_percent": cfg.soc_max_percent,
+            "dhw_tank_liters": cfg.dhw_tank_liters,
+            "dhw_comfort_min": cfg.dhw_comfort_min,
+            "dhw_max_temp": cfg.dhw_max_temp,
+            "dhw_cop": cfg.dhw_cop,
+            "replan_interval_minutes": cfg.replan_interval_minutes,
+            "ml_enabled": cfg.ml_enabled,
+        }
     return JSONResponse({
         "status": "ok",
         "version": _state.get("version", "?"),
@@ -281,6 +336,7 @@ async def status() -> JSONResponse:
         "objective": result.objective_value if result else None,
         "pv_forecast_kwh": result.pv_forecast_kwh_total if result else None,
         "load_forecast_kwh": result.load_forecast_kwh_total if result else None,
+        "cfg": cfg_data,
     })
 
 
@@ -290,7 +346,7 @@ async def schedule() -> JSONResponse:
     if result is None:
         raise HTTPException(status_code=503, detail="No schedule available yet")
 
-    cop = 3.0
+    cop = _state["cfg"].dhw_cop if _state.get("cfg") else 3.0
     slots = []
     for t in range(48):
         h, m = divmod(t * 30, 60)
