@@ -227,6 +227,7 @@ def replan(
                      slot, result.dhw_heat_energy[slot], result.offpeak_precharge_w[slot])
 
         mqtt.publish_plan(result, phase=phase, last_run=now_utc)
+        mqtt.publish_current_slot(result, slot, dhw_cop=cfg.dhw_cop)
         set_state("last_result", result)
         set_state("last_run", now_utc)
         set_state("phase", phase)

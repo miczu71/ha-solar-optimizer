@@ -62,6 +62,42 @@ SENSOR_CONFIGS = {
         "icon": "mdi:solar-power",
         "value_template": "{{ value_json.state }}",
     },
+    # Per-slot planned values — update every 30 min, enable plan-vs-reality charts
+    "planned_pv_w": {
+        "name": "Optimizer Planned PV Power",
+        "unit_of_measurement": "W",
+        "device_class": "power",
+        "state_class": "measurement",
+        "value_template": "{{ value_json.state }}",
+    },
+    "planned_load_w": {
+        "name": "Optimizer Planned Load Power",
+        "unit_of_measurement": "W",
+        "device_class": "power",
+        "state_class": "measurement",
+        "value_template": "{{ value_json.state }}",
+    },
+    "planned_grid_import_w": {
+        "name": "Optimizer Planned Grid Import",
+        "unit_of_measurement": "W",
+        "device_class": "power",
+        "state_class": "measurement",
+        "value_template": "{{ value_json.state }}",
+    },
+    "planned_soc_pct": {
+        "name": "Optimizer Planned Battery SoC",
+        "unit_of_measurement": "%",
+        "icon": "mdi:battery-charging",
+        "state_class": "measurement",
+        "value_template": "{{ value_json.state }}",
+    },
+    "planned_dhw_temp_c": {
+        "name": "Optimizer Planned DHW Temperature",
+        "unit_of_measurement": "°C",
+        "device_class": "temperature",
+        "state_class": "measurement",
+        "value_template": "{{ value_json.state }}",
+    },
 }
 
 SWITCH_CONFIGS = {
@@ -225,6 +261,36 @@ class MQTTPublisher:
             json.dumps({"state": round(mape, 2)}),
             retain=True,
         )
+
+    def publish_current_slot(self, result: OptimizeResult, slot: int, dhw_cop: float = 3.0) -> None:
+        """Publish per-slot planned values as individual HA sensor entities.
+
+        These update every 30 min so HA's statistics engine builds a time-series
+        that can be overlaid against actual sensor readings in ApexCharts.
+        """
+        def _kwh_to_w(kwh: float) -> float:
+            return round(kwh / 0.5 * 1000, 1)
+
+        pv_w = _kwh_to_w(result.pv_forecast_kwh[slot]) if result.pv_forecast_kwh else 0.0
+        dhw_elec_kwh = (result.dhw_heat_energy[slot] / dhw_cop) if result.dhw_heat_energy else 0.0
+        base_kwh = result.base_load_kwh[slot] if result.base_load_kwh else 0.0
+        load_w = _kwh_to_w(base_kwh + dhw_elec_kwh)
+        grid_import_w = _kwh_to_w(result.grid_import_kwh[slot]) if result.grid_import_kwh else 0.0
+        soc_pct = round(result.soc_trajectory[slot], 1) if result.soc_trajectory else 0.0
+        dhw_temp = round(result.dhw_temp_trajectory[slot], 1) if result.dhw_temp_trajectory else 0.0
+
+        for name, value in [
+            ("planned_pv_w", pv_w),
+            ("planned_load_w", load_w),
+            ("planned_grid_import_w", grid_import_w),
+            ("planned_soc_pct", soc_pct),
+            ("planned_dhw_temp_c", dhw_temp),
+        ]:
+            self._client.publish(
+                self._state_topic("sensor", name),
+                json.dumps({"state": value}),
+                retain=True,
+            )
 
     def is_enabled(self) -> bool:
         return self._switch_states["enabled"]

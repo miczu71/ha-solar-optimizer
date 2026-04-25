@@ -5,6 +5,20 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [0.3.5] — 2026-04-25
+
+### Added
+- **5 per-slot planned-value sensors** published to HA via MQTT every 30 min:
+  `sensor.optimizer_planned_pv_w`, `sensor.optimizer_planned_load_w`,
+  `sensor.optimizer_planned_grid_import_w`, `sensor.optimizer_planned_soc_pct`,
+  `sensor.optimizer_planned_dhw_temp_c`. All have `state_class: measurement` so
+  HA's statistics engine builds a history that ApexCharts can overlay against
+  actual sensor readings for plan-vs-reality comparison.
+- `MQTTPublisher.publish_current_slot()` method populates the above from the
+  current-slot values of the latest OptimizeResult on every successful replan.
+
+---
+
 ## [0.3.4] — 2026-04-25
 
 ### Fixed
