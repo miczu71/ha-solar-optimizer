@@ -51,7 +51,6 @@ def build_pv_forecast(ha: HAClient) -> list[float]:
 
     Solcast pv_estimate is in kW (average power for the 30-min interval).
     Multiply by 0.5 to convert to kWh per slot.
-    Slot indexing and date filtering use HA's local timezone.
     """
     slots_raw = ha.get_solcast_forecast()
     by_slot: dict[int, float] = {}
@@ -84,7 +83,6 @@ def build_base_load_forecast(
     if phase == 2 and forecaster.is_ready():
         try:
             outdoor = ha.outdoor_temp
-            # Fetch real per-slot lag values from InfluxDB; fall back to defaults on error
             lag_1d = {}
             lag_7d = {}
             pv_yesterday = 5.0
@@ -172,16 +170,17 @@ def replan(
         pv_forecast = build_pv_forecast(ha)
         base_load = build_base_load_forecast(influx, forecaster, ha, cfg, now_local, phase)
 
+        # Store forecasts in state so /compare can build naive/JIT trajectory
+        set_state("last_pv_forecast", pv_forecast)
+        set_state("last_base_load", base_load)
+
         soc = ha.soc_percent
         soc_min = max(cfg.soc_min_percent, ha.soc_min_from_backup)
         dhw_temp = ha.dhw_tank_temp
         outdoor = ha.outdoor_temp
 
-        # Compute current slot before building dhw_demand_slots
         slot = now_local.hour * 2 + now_local.minute // 30
 
-        # If a bath has been requested, mark next 2 hours (4 slots) as DHW demand
-        # so the LP ensures the tank is hot enough by then.
         dhw_demand_slots = [False] * 48
         if ha.bath_request:
             demand_end = min(48, slot + 4)
@@ -237,7 +236,6 @@ def replan(
             self_cons = max(0.0, (pv_total - sum(result.grid_export_kwh)) / pv_total * 100)
             mqtt.publish_self_consumption(self_cons)
 
-        # Grid import avoided: naive (no-dispatch) baseline minus optimised import
         naive_import = sum(max(0.0, base_load[t] - pv_forecast[t]) for t in range(48))
         avoided = max(0.0, naive_import - sum(result.grid_import_kwh))
         mqtt.publish_grid_import_avoided(avoided)
@@ -297,8 +295,6 @@ def main() -> None:
 
     mqtt.connect()
 
-    # Start HTTP server in a daemon thread immediately so the dashboard is
-    # available and shows status during training and the first replan.
     server_thread = threading.Thread(
         target=uvicorn.run,
         kwargs={"app": app, "host": "0.0.0.0", "port": 8099, "log_level": "warning"},
@@ -311,6 +307,7 @@ def main() -> None:
     set_state("phase", phase)
     set_state("version", version)
     set_state("cfg", cfg)
+    set_state("ha", ha)
 
     def _replan():
         replan(cfg, ha, influx, executor, mqtt, forecaster, phase)

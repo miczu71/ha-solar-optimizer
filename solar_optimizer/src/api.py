@@ -1,11 +1,13 @@
 """FastAPI ingress API with tabbed shadow-mode dashboard."""
 import json
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Optional
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse, HTMLResponse
+
+from optimizer import g12w_peak_vector
 
 log = logging.getLogger(__name__)
 app = FastAPI(title="Solar Optimizer")
@@ -16,6 +18,9 @@ _state: dict[str, Any] = {
     "phase": 1,
     "version": "?",
     "cfg": None,
+    "ha": None,
+    "last_pv_forecast": None,
+    "last_base_load": None,
     "replan_fn": None,
 }
 
@@ -24,12 +29,168 @@ def set_state(key: str, value: Any) -> None:
     _state[key] = value
 
 
-# All fetch() calls and href links use RELATIVE paths (no leading slash).
-# When served through HA ingress the page URL is:
-#   https://ha:8123/api/hassio_ingress/{token}/
-# Absolute paths like /status resolve to https://ha:8123/status (HA frontend).
-# Relative paths like 'status' resolve to .../api/hassio_ingress/{token}/status
-# which the supervisor proxy correctly forwards to the add-on.
+# ---- JIT comparison helpers -------------------------------------------------
+
+def _compute_naive_soc(pv_forecast: list[float], base_load: list[float],
+                        soc_init_pct: float, cfg) -> list[float]:
+    """SoC trajectory with no optimizer intervention."""
+    cap = cfg.battery_capacity_kwh
+    soc_min = cap * cfg.soc_min_percent / 100
+    soc_max = cap * cfg.soc_max_percent / 100
+    soc = max(soc_min, min(soc_max, soc_init_pct / 100 * cap))
+    traj = [round(soc / cap * 100, 1)]
+    for t in range(48):
+        surplus = max(pv_forecast[t] - base_load[t], 0.0)
+        deficit = max(base_load[t] - pv_forecast[t], 0.0)
+        soc = min(soc + surplus * 0.95, soc_max)
+        soc = max(soc - deficit / 0.95, soc_min)
+        traj.append(round(soc / cap * 100, 1))
+    return traj
+
+
+def _compute_jit_soc(pv_forecast: list[float], base_load: list[float],
+                     soc_init_pct: float, is_peak: list[bool],
+                     target_soc_pct: float, req_power_w: float,
+                     cfg) -> tuple[list[float], list[float]]:
+    """SoC trajectory simulating JIT: charge at req_power during off-peak until target."""
+    cap = cfg.battery_capacity_kwh
+    soc_min = cap * cfg.soc_min_percent / 100
+    soc_max = cap * cfg.soc_max_percent / 100
+    soc = max(soc_min, min(soc_max, soc_init_pct / 100 * cap))
+    target_kwh = min(target_soc_pct / 100 * cap, soc_max)
+    traj = [round(soc / cap * 100, 1)]
+    charges: list[float] = []
+    for t in range(48):
+        surplus = max(pv_forecast[t] - base_load[t], 0.0)
+        deficit = max(base_load[t] - pv_forecast[t], 0.0)
+        charge_kwh = 0.0
+        if not is_peak[t] and soc < target_kwh:
+            avail = max(0.0, (target_kwh - soc) / 0.95)
+            charge_kwh = min(req_power_w / 1000 * 0.5, avail)
+        charges.append(round(charge_kwh / 0.5 * 1000, 0))  # back to W
+        soc = soc + surplus * 0.95 + charge_kwh * 0.95 - deficit / 0.95
+        soc = max(soc_min, min(soc_max, soc))
+        traj.append(round(soc / cap * 100, 1))
+    return traj, charges
+
+
+def _compute_jit_status(ha, cfg) -> dict:
+    """Replicate the JIT battery automation Jinja2 template logic in Python."""
+    capacity = cfg.battery_capacity_kwh
+    backup_reserve = 16  # % — hardcoded in the existing JIT automation
+
+    try:
+        soc = ha.soc_percent
+        house_now_kw = ha.house_load_w / 1000
+        house_avg_kw = ha.get_state_value("sensor.srednie_zuzycie_domu_1h", 1500.0) / 1000
+        pv_now_kw = ha.pv_power_w / 1000
+        net_load_kw = max(house_avg_kw - pv_now_kw, 0.1)
+        threshold = ha.get_state_value("input_number.prog_prognozy_slonca", 8.0)
+
+        try:
+            is_wd = ha.get_state("binary_sensor.workday")["state"] == "on"
+        except Exception:
+            is_wd = True
+        try:
+            is_wd_tom = ha.get_state("binary_sensor.workday_tomorrow")["state"] == "on"
+        except Exception:
+            is_wd_tom = True
+
+        now_local = ha.local_now
+        h = now_local.hour
+
+        f_rem = ha.get_state_value("sensor.solcast_pv_forecast_forecast_remaining_today", 0.0)
+        f_tom = ha.get_state_value("sensor.solcast_pv_forecast_forecast_tomorrow", 0.0)
+        forecast = f_tom if h >= 15 else f_rem
+
+        # PV takeover = sunrise + 90 min
+        try:
+            sun_attrs = ha.get_state("sun.sun").get("attributes", {})
+            nr_str = sun_attrs.get("next_rising", "")
+            nr = datetime.fromisoformat(nr_str.replace("Z", "+00:00"))
+            sunrise = nr.astimezone(ha.tz)
+        except Exception:
+            sunrise = now_local.replace(hour=6, minute=0, second=0, microsecond=0)
+        takeover = sunrise + timedelta(minutes=90)
+
+        if h < 6:
+            t_end = now_local.replace(hour=6, minute=0, second=0, microsecond=0)
+            active_wd = is_wd
+        elif h < 15:
+            t_end = now_local.replace(hour=15, minute=0, second=0, microsecond=0)
+            active_wd = is_wd
+        else:
+            t_end = (now_local + timedelta(days=1)).replace(
+                hour=6, minute=0, second=0, microsecond=0)
+            active_wd = is_wd_tom
+
+        gap_h = max((takeover - t_end).total_seconds() / 3600, 0) if t_end.hour == 6 else 0
+        gap_soc = (gap_h * net_load_kw / capacity) * 100
+
+        if 6 <= h < 15 and is_wd:
+            t_goal: float = 100 if forecast < 5.0 else backup_reserve
+        elif (h < 6 and is_wd) or (h >= 15 and is_wd_tom):
+            if forecast < threshold:
+                t_goal = 100
+            else:
+                t_goal = min(max(backup_reserve + 15, gap_soc + 20), 100)
+            t_goal = round(t_goal)
+        else:
+            t_goal = backup_reserve
+
+        energy_needed = max((t_goal - soc) / 100 * capacity, 0.0)
+        time_left_h = max((t_end - now_local).total_seconds() / 3600, 0.01)
+        req_power_w = int(energy_needed / time_left_h * 1000 * 1.15)
+
+        try:
+            status_text = ha.get_state("input_text.ostatni_status_ladowania")["state"]
+        except Exception:
+            status_text = "—"
+
+        if not active_wd and h < 15:
+            analysis = "Day off — cheap tariff all day"
+        elif h >= 15 and not is_wd_tom:
+            analysis = "Tomorrow is a day off — no overnight precharge needed"
+        elif soc >= t_goal:
+            analysis = "Battery reached target SoC ✔"
+        elif req_power_w < 500:
+            analysis = f"Required power ({req_power_w} W) too low — waiting to reach ≥500 W"
+        else:
+            analysis = "Active charging in progress"
+
+        return {
+            "status_text": status_text,
+            "calendar_today": "workday" if is_wd else "weekend",
+            "calendar_tomorrow": "workday" if is_wd_tom else "weekend",
+            "house_now_kw": round(house_now_kw, 3),
+            "house_avg_kw": round(house_avg_kw, 3),
+            "pv_now_kw": round(pv_now_kw, 3),
+            "net_load_kw": round(net_load_kw, 3),
+            "forecast_kwh": round(forecast, 1),
+            "forecast_threshold": threshold,
+            "pv_takeover": takeover.strftime("%H:%M"),
+            "target_soc_pct": int(t_goal),
+            "target_time": t_end.strftime("%H:%M"),
+            "time_left_h": round(time_left_h, 2),
+            "req_power_w": req_power_w,
+            "soc_now": round(soc, 1),
+            "analysis": analysis,
+        }
+    except Exception as exc:
+        log.error("JIT status computation failed: %s", exc)
+        return {
+            "status_text": f"Error: {exc}",
+            "calendar_today": "?", "calendar_tomorrow": "?",
+            "house_now_kw": 0.0, "house_avg_kw": 0.0,
+            "pv_now_kw": 0.0, "net_load_kw": 0.0,
+            "forecast_kwh": 0.0, "forecast_threshold": 8.0,
+            "pv_takeover": "—", "target_soc_pct": 16,
+            "target_time": "—", "time_left_h": 0.0,
+            "req_power_w": 0, "soc_now": 0.0,
+            "analysis": "Read error — check add-on logs",
+        }
+
+
 _DASHBOARD_HTML = """\
 <!DOCTYPE html>
 <html lang="en">
@@ -41,11 +202,11 @@ _DASHBOARD_HTML = """\
 :root{--bg:#0f172a;--card:#1e293b;--b:#334155;--t:#e2e8f0;--m:#94a3b8;
   --g:#4ade80;--r:#f87171;--o:#fb923c;--bl:#60a5fa;--p:#a78bfa;--y:#fbbf24}
 *{box-sizing:border-box;margin:0;padding:0}
-body{font-family:monospace;background:var(--bg);color:var(--t);padding:16px;max-width:1024px;margin:0 auto}
+body{font-family:monospace;background:var(--bg);color:var(--t);padding:16px;max-width:1100px;margin:0 auto}
 h1{color:var(--g);margin-bottom:4px}h1 span{font-size:.55em;color:var(--m)}
 .badges{margin:8px 0 12px}
 .badge{display:inline-block;padding:3px 10px;border-radius:12px;background:var(--card);border:1px solid var(--b);font-size:.82em;margin-right:6px}
-.tabs{display:flex;border-bottom:1px solid var(--b);margin-bottom:16px}
+.tabs{display:flex;border-bottom:1px solid var(--b);margin-bottom:16px;flex-wrap:wrap}
 .tab{background:none;border:none;color:var(--m);padding:8px 16px;cursor:pointer;font:inherit;font-size:.9em;border-bottom:2px solid transparent}
 .tab.active,.tab:hover{color:var(--t)}.tab.active{border-bottom-color:var(--bl)}
 .panel{display:none}.panel.active{display:block}
@@ -65,6 +226,10 @@ a{color:var(--bl);text-decoration:none}a:hover{text-decoration:underline}
 details{margin-top:14px}
 details summary{cursor:pointer;color:var(--bl);font-size:.82em;user-select:none;padding:4px 0}
 details summary:hover{color:var(--t)}
+.grid2{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+@media(max-width:680px){.grid2{grid-template-columns:1fr}}
+.btn-sm{background:var(--card);border:1px solid var(--b);color:var(--bl);padding:4px 12px;border-radius:6px;cursor:pointer;font:inherit;font-size:.82em}
+.btn-sm:hover{color:var(--t);border-color:var(--bl)}
 </style>
 </head>
 <body>
@@ -77,6 +242,7 @@ details summary:hover{color:var(--t)}
   <button class="tab active" onclick="showTab('status',this)">Status</button>
   <button class="tab" onclick="showTab('plan',this)">Today&#39;s Plan</button>
   <button class="tab" onclick="showTab('history',this)">History</button>
+  <button class="tab" onclick="showTab('compare',this)">Compare</button>
 </div>
 
 <div id="panel-status" class="panel active">
@@ -125,18 +291,52 @@ details summary:hover{color:var(--t)}
   </table>
 </div>
 
+<div id="panel-compare" class="panel">
+  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+    <span style="color:var(--m);font-size:.82em">Live data &mdash; reads HA sensors on every open</span>
+    <button class="btn-sm" onclick="loadCompare()">&#8635; Refresh</button>
+  </div>
+  <div id="compare-msg"><p class="msg">&#9432; Loading&hellip;</p></div>
+  <div class="grid2">
+    <div class="cw"><div class="ct">JIT Battery Control (existing automation)</div><div id="jit-card"></div></div>
+    <div class="cw"><div class="ct">Solar Optimizer (shadow plan)</div><div id="opt-card"></div></div>
+  </div>
+  <div class="cw" id="cc-wrap" style="display:none">
+    <div class="ct">SoC trajectory comparison</div>
+    <div class="legend">
+      <span><span class="dot" style="background:#60a5fa"></span>Optimizer</span>
+      <span><span class="dot" style="background:#fbbf24"></span>JIT simulation</span>
+      <span><span class="dot" style="background:#475569"></span>No action (naive)</span>
+    </div>
+    <canvas id="cc" height="100"></canvas>
+  </div>
+  <div style="overflow-x:auto;margin-top:12px">
+    <table>
+      <thead><tr>
+        <th>Time</th><th>Tariff</th><th>PV kWh</th><th>Load kWh</th>
+        <th style="color:#fbbf24">JIT chg W</th>
+        <th style="color:#60a5fa">Opt prechg W</th>
+        <th style="color:#a78bfa">Opt DHW kWh</th>
+        <th style="color:#f87171">Opt import</th>
+      </tr></thead>
+      <tbody id="ctab"></tbody>
+    </table>
+  </div>
+</div>
+
 <div class="links">
   <a href="status">JSON status</a><span class="sep">|</span>
   <a href="schedule">JSON schedule</a><span class="sep">|</span>
+  <a href="compare">JSON compare</a><span class="sep">|</span>
   <a href="#" onclick="triggerReplan();return false">Force replan</a>
 </div>
 
 <script>
-let eChart=null,tChart=null,planLoaded=false,histLoaded=false,_retryTimer=null;
+let eChart=null,tChart=null,cChart=null,planLoaded=false,histLoaded=false,_retryTimer=null;
 const SL=Array.from({length:48},(_,i)=>`${String(i>>1).padStart(2,'0')}:${i&1?'30':'00'}`);
 const CO={responsive:true,interaction:{intersect:false,mode:'index'},
   plugins:{legend:{display:false},
-    tooltip:{callbacks:{label:c=>`${c.dataset.label}: ${c.parsed.y!=null?c.parsed.y.toFixed(3):'-'}`}}},
+    tooltip:{callbacks:{label:c=>`${c.dataset.label}: ${c.parsed.y!=null?c.parsed.y.toFixed(2):'-'}`}}},
   scales:{x:{ticks:{color:'#64748b',font:{size:10},maxTicksLimit:13},grid:{color:'#1a2640'}}}};
 
 function showTab(n,b){
@@ -145,6 +345,7 @@ function showTab(n,b){
   document.getElementById('panel-'+n).classList.add('active');b.classList.add('active');
   if(n==='plan'&&!planLoaded)loadPlan();
   if(n==='history'&&!histLoaded)loadHistory();
+  if(n==='compare')loadCompare();
 }
 
 async function loadStatus(){
@@ -188,12 +389,12 @@ function renderAssumptions(d){
   const rows=[
     ['Mode',modeStr],
     ['Load forecast',phaseStr],
-    ['PV source','Solcast detailedForecast (30-min slots &times; 0.5 = kWh)'],
+    ['PV source','Solcast detailedForecast (30-min slots × 0.5 = kWh)'],
     ['Planning horizon','24 h · 48 × 30-min slots starting at midnight'],
     ['Battery',`${c.battery_capacity_kwh} kWh · SoC ${c.soc_min_percent}–${c.soc_max_percent}%`],
     ['G12W peak hours','Mon–Fri 06:00–13:00 &amp; 15:00–22:00 — 1.23 PLN/kWh'],
     ['G12W off-peak hours','All other hours (incl. weekends) — 0.63 PLN/kWh'],
-    ['Objective',`&#8595; grid import ×1.0 + &#8595; peak cost ×0.3 + &#8595; DHW thrash ×0.05 + &#8595; bat wear ×0.02 − &#8593; SoC@midnight ×0.15`],
+    ['Objective','↓ import ×1.0 + ↓ peak cost ×0.3 + ↓ DHW thrash ×0.05 + ↓ bat wear ×0.02 − ↑ SoC@midnight ×0.15'],
     ['Why SoC@midnight?','Rewards topping up battery before overnight discharge (base load drains 3–5 kWh nightly)'],
     ['DHW tank',`${c.dhw_tank_liters} L · comfort ${c.dhw_comfort_min}–${c.dhw_max_temp}°C · COP ${c.dhw_cop}`],
     ['Replan interval',`every ${c.replan_interval_minutes} min`],
@@ -219,7 +420,6 @@ async function loadPlan(){
       ticks:{color:clr,font:{size:10}},grid:{color:pos==='left'?'#1a2640':undefined,drawOnChartArea:pos==='left'},
       title:{display:true,text:lbl,color:clr,font:{size:10}}
     });
-
     if(eChart)eChart.destroy();
     eChart=new Chart(document.getElementById('ce').getContext('2d'),{
       data:{labels:SL,datasets:[
@@ -230,7 +430,6 @@ async function loadPlan(){
       ]},
       options:{...CO,scales:{...CO.scales,y:{ticks:{color:'#64748b',font:{size:10}},grid:{color:'#1a2640'},title:{display:true,text:'kWh',color:'#64748b',font:{size:10}}}}}
     });
-
     if(tChart)tChart.destroy();
     tChart=new Chart(document.getElementById('ct').getContext('2d'),{
       type:'line',
@@ -241,7 +440,6 @@ async function loadPlan(){
       options:{...CO,plugins:{...CO.plugins,legend:{display:true,labels:{color:'#e2e8f0',font:{family:'monospace',size:11},boxWidth:10}}},
         scales:{...CO.scales,soc:yAx('soc','left','#60a5fa',0,105,'SoC %'),dhw:yAx('dhw','right','#fb923c',35,65,'DHW °C')}}
     });
-
     const now=new Date();
     const cur=now.getHours()*2+(now.getMinutes()>=30?1:0);
     document.getElementById('pt').innerHTML=s.map((x,i)=>{
@@ -264,7 +462,6 @@ async function loadPlan(){
   }catch(e){
     document.getElementById('plan-msg').innerHTML='<p class="msg">&#8987; Waiting for first replan…</p>';
     planLoaded=false;
-    console.error('Plan load error:',e);
   }
 }
 
@@ -285,8 +482,84 @@ async function loadHistory(){
         <td>${sc}</td></tr>`;
     }).join('');
   }catch(e){
-    document.getElementById('ht').innerHTML='<tr><td colspan=6 style="color:#94a3b8">&#8987; Server starting up — click History again in a moment</td></tr>';
+    document.getElementById('ht').innerHTML='<tr><td colspan=6 style="color:#94a3b8">&#8987; Server starting up — try again in a moment</td></tr>';
     histLoaded=false;
+  }
+}
+
+async function loadCompare(){
+  document.getElementById('compare-msg').innerHTML='<p class="msg">&#8987; Reading live HA sensors…</p>';
+  document.getElementById('jit-card').innerHTML='';
+  document.getElementById('opt-card').innerHTML='';
+  document.getElementById('cc-wrap').style.display='none';
+  document.getElementById('ctab').innerHTML='';
+  try{
+    const d=await fetch('compare').then(r=>{if(!r.ok)throw new Error('HTTP '+r.status);return r.json();});
+    if(d.error){document.getElementById('compare-msg').innerHTML=`<p class="msg">⚠ ${d.error}</p>`;return;}
+    const j=d.jit,o=d.optimizer,cur=d.current_slot;
+    document.getElementById('compare-msg').innerHTML='';
+
+    function mkT(rows){
+      return '<table><tbody>'+rows.map(([k,v])=>`<tr><td style="color:#94a3b8;width:52%;padding:4px 8px;white-space:normal">${k}</td><td style="padding:4px 8px">${v}</td></tr>`).join('')+'</tbody></table>';
+    }
+    const calT=j.calendar_today==='workday'?'&#127970; Work':'&#127958; Off';
+    const calTom=j.calendar_tomorrow==='workday'?'&#127970; Work':'&#127958; Off';
+    document.getElementById('jit-card').innerHTML=mkT([
+      ['Status',j.status_text||'—'],
+      ['Calendar',`Today: ${calT} &nbsp;|&nbsp; Tomorrow: ${calTom}`],
+      ['SoC now',`<strong>${j.soc_now}%</strong>`],
+      ['House (now / avg 1h)',`${j.house_now_kw.toFixed(2)} / ${j.house_avg_kw.toFixed(2)} kW`],
+      ['PV now',`<span style="color:#4ade80">${j.pv_now_kw.toFixed(2)} kW</span>`],
+      ['Net load',`${j.net_load_kw.toFixed(2)} kW`],
+      ['Solar forecast',`${j.forecast_kwh} kWh &nbsp;<span style="color:#475569">(threshold: ${j.forecast_threshold})</span>`],
+      ['PV takeover',j.pv_takeover],
+      ['Target SoC',`<strong>${j.target_soc_pct}%</strong> by ${j.target_time}`],
+      ['Time left / req. power',`${j.time_left_h.toFixed(1)} h &nbsp;/ &nbsp;<span style="color:#fbbf24">${j.req_power_w} W</span>`],
+      ['Analysis',`<em style="color:#e2e8f0">${j.analysis}</em>`],
+    ]);
+    const sc=o.solver_status==='Optimal'?'#4ade80':'#f87171';
+    document.getElementById('opt-card').innerHTML=mkT([
+      ['Solver / Phase',`<span style="color:${sc}">${o.solver_status}</span> &nbsp;/ P${o.phase}`],
+      ['SoC now',`<strong>${o.soc_now}%</strong>`],
+      ['EOD SoC (midnight)',`<strong style="color:#60a5fa">${o.soc_eod_pct}%</strong>`],
+      ['PV forecast 24h',`<span style="color:#4ade80">${o.pv_forecast_24h_kwh} kWh</span>`],
+      ['Load forecast 24h',`${o.load_forecast_24h_kwh} kWh`],
+      ['Grid import planned',o.grid_import_total_kwh!=null?`<span style="color:#f87171">${o.grid_import_total_kwh} kWh</span>`:'—'],
+      ['Battery precharge today',`${o.precharge_total_kwh} kWh`],
+      ['DHW heat today',`<span style="color:#a78bfa">${o.dhw_heat_total_kwh} kWh</span>`],
+      ['This slot: precharge',`<span style="color:#60a5fa">${o.current_slot_precharge_w} W</span>`],
+      ['This slot: DHW heat',`<span style="color:#a78bfa">${o.current_slot_dhw_kwh} kWh</span>`],
+    ]);
+
+    document.getElementById('cc-wrap').style.display='block';
+    if(cChart)cChart.destroy();
+    cChart=new Chart(document.getElementById('cc').getContext('2d'),{
+      type:'line',
+      data:{labels:SL,datasets:[
+        {label:'Optimizer',data:d.soc_trajectory_optimizer.slice(0,48),borderColor:'#60a5fa',backgroundColor:'rgba(96,165,250,.12)',fill:true,tension:.4,pointRadius:0,borderWidth:2},
+        {label:'JIT simulation',data:d.soc_trajectory_jit.slice(0,48),borderColor:'#fbbf24',borderDash:[5,3],tension:.4,pointRadius:0,borderWidth:1.5},
+        {label:'No action',data:d.soc_trajectory_naive.slice(0,48),borderColor:'#475569',borderDash:[2,4],tension:.4,pointRadius:0,borderWidth:1},
+      ]},
+      options:{...CO,plugins:{...CO.plugins,legend:{display:true,labels:{color:'#e2e8f0',font:{family:'monospace',size:11},boxWidth:10}}},
+        scales:{...CO.scales,y:{min:0,max:105,ticks:{color:'#64748b',font:{size:10}},grid:{color:'#1a2640'},title:{display:true,text:'SoC %',color:'#64748b',font:{size:10}}}}}
+    });
+
+    document.getElementById('ctab').innerHTML=d.slots.map((x,i)=>{
+      const jcw=x.jit_charge_w>10?`<span style="color:#fbbf24">${Math.round(x.jit_charge_w)}</span>`:'—';
+      const ocw=x.optimizer_precharge_w>10?`<span style="color:#60a5fa">${Math.round(x.optimizer_precharge_w)}</span>`:'—';
+      const odhw=x.optimizer_dhw_kwh>.01?`<span style="color:#a78bfa">${x.optimizer_dhw_kwh.toFixed(3)}</span>`:'—';
+      const ogi=x.optimizer_grid_import_kwh>.002?`<span style="color:#f87171">${x.optimizer_grid_import_kwh.toFixed(3)}</span>`:'—';
+      return `<tr class="${x.is_peak?'pk':''}${i===cur?' now':''}">
+        <td>${x.time}</td>
+        <td style="color:${x.is_peak?'#f87171':'#4ade80'}">${x.is_peak?'PEAK':'off'}</td>
+        <td style="color:#4ade80">${x.pv_kwh.toFixed(3)}</td>
+        <td>${x.base_load_kwh.toFixed(3)}</td>
+        <td>${jcw}</td><td>${ocw}</td><td>${odhw}</td><td>${ogi}</td></tr>`;
+    }).join('');
+    const rows2=document.getElementById('ctab').querySelectorAll('tr');
+    if(rows2[cur])rows2[cur].scrollIntoView({block:'center'});
+  }catch(e){
+    document.getElementById('compare-msg').innerHTML=`<p class="msg">&#9888; ${e.message||'Failed to load'} — check add-on logs</p>`;
   }
 }
 
@@ -345,7 +618,6 @@ async def schedule() -> JSONResponse:
     result = _state.get("last_result")
     if result is None:
         raise HTTPException(status_code=503, detail="No schedule available yet")
-
     cop = _state["cfg"].dhw_cop if _state.get("cfg") else 3.0
     slots = []
     for t in range(48):
@@ -368,7 +640,6 @@ async def schedule() -> JSONResponse:
             "dhw_temp_c": round(result.dhw_temp_trajectory[t], 1),
             "precharge_w": round(result.offpeak_precharge_w[t], 0),
         })
-
     return JSONResponse({"slots": slots})
 
 
@@ -377,7 +648,7 @@ async def history() -> JSONResponse:
     try:
         with open("/data/plan_history.jsonl") as f:
             lines = f.readlines()
-        records = [json.loads(l) for l in lines if l.strip()]
+        records = [json.loads(line) for line in lines if line.strip()]
         by_date: dict[str, Any] = {}
         for r in records:
             d = r.get("date", "")
@@ -389,6 +660,72 @@ async def history() -> JSONResponse:
     except Exception as exc:
         log.warning("History read error: %s", exc)
         return JSONResponse([])
+
+
+@app.get("/compare")
+def compare() -> JSONResponse:
+    """Live comparison: JIT automation state vs optimizer plan. Sync: runs in FastAPI threadpool."""
+    ha = _state.get("ha")
+    cfg = _state.get("cfg")
+    result = _state.get("last_result")
+    pv_forecast: list[float] = _state.get("last_pv_forecast") or [0.0] * 48
+    base_load: list[float] = _state.get("last_base_load") or [0.3] * 48
+
+    if ha is None or cfg is None:
+        return JSONResponse({"error": "Not ready — waiting for first replan"}, status_code=503)
+
+    jit = _compute_jit_status(ha, cfg)
+
+    now_local = ha.local_now
+    is_peak = g12w_peak_vector(now_local)
+    soc_now = jit["soc_now"]
+    current_slot = now_local.hour * 2 + now_local.minute // 30
+
+    naive_traj = _compute_naive_soc(pv_forecast, base_load, soc_now, cfg)
+    jit_traj, jit_charges = _compute_jit_soc(
+        pv_forecast, base_load, soc_now, is_peak,
+        float(jit["target_soc_pct"]), float(jit["req_power_w"]), cfg,
+    )
+    optimizer_traj = result.soc_trajectory if result else naive_traj
+
+    precharge_total = sum(w / 1000 * 0.5 for w in result.offpeak_precharge_w) if result else 0.0
+
+    slots = []
+    for t in range(48):
+        h, m = divmod(t * 30, 60)
+        slots.append({
+            "slot": t,
+            "time": f"{h:02d}:{m:02d}",
+            "is_peak": is_peak[t],
+            "pv_kwh": round(pv_forecast[t], 3),
+            "base_load_kwh": round(base_load[t], 3),
+            "jit_charge_w": round(jit_charges[t], 0),
+            "optimizer_precharge_w": round(result.offpeak_precharge_w[t], 0) if result else 0,
+            "optimizer_dhw_kwh": round(result.dhw_heat_energy[t], 3) if result else 0,
+            "optimizer_grid_import_kwh": round(result.grid_import_kwh[t], 3) if result else 0,
+        })
+
+    return JSONResponse({
+        "jit": jit,
+        "optimizer": {
+            "soc_now": round(soc_now, 1),
+            "soc_eod_pct": round(optimizer_traj[-1], 1),
+            "pv_forecast_24h_kwh": round(sum(pv_forecast), 2),
+            "load_forecast_24h_kwh": round(sum(base_load), 2),
+            "grid_import_total_kwh": round(sum(result.grid_import_kwh), 2) if result else None,
+            "precharge_total_kwh": round(precharge_total, 2),
+            "dhw_heat_total_kwh": round(sum(result.dhw_heat_energy), 2) if result else 0.0,
+            "solver_status": result.status if result else "No plan yet",
+            "phase": _state.get("phase", 1),
+            "current_slot_precharge_w": round(result.offpeak_precharge_w[current_slot], 0) if result else 0,
+            "current_slot_dhw_kwh": round(result.dhw_heat_energy[current_slot], 3) if result else 0.0,
+        },
+        "soc_trajectory_optimizer": [round(v, 1) for v in optimizer_traj],
+        "soc_trajectory_naive": [round(v, 1) for v in naive_traj],
+        "soc_trajectory_jit": [round(v, 1) for v in jit_traj],
+        "current_slot": current_slot,
+        "slots": slots,
+    })
 
 
 @app.post("/force-replan")

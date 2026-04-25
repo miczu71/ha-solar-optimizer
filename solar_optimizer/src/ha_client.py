@@ -53,6 +53,13 @@ class HAClient:
             log.warning("Failed to read %s, using default %s", entity_id, default)
             return default
 
+    def get_state_str(self, entity_id: str, default: str = "") -> str:
+        try:
+            return str(self.get_state(entity_id)["state"])
+        except Exception:
+            log.warning("Failed to read str state %s, using default '%s'", entity_id, default)
+            return default
+
     def call_service(self, domain: str, service: str, data: dict[str, Any]) -> None:
         url = f"{self._base}/api/services/{domain}/{service}"
         r = httpx.post(url, headers=self._headers, json=data, timeout=TIMEOUT)
