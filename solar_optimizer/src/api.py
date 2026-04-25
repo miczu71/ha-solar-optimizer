@@ -254,18 +254,33 @@ details summary:hover{color:var(--t)}
 </div>
 
 <div id="panel-plan" class="panel">
+  <div id="now-strip" style="display:none;background:#0f1f36;border:1px solid #1e3a5f;border-radius:6px;padding:8px 12px;margin-bottom:10px;font-size:.8em">
+    <div style="color:#94a3b8;margin-bottom:6px">&#9654; Current slot: <span id="now-slot-label" style="color:#e2e8f0;font-weight:600"></span></div>
+    <div style="display:grid;grid-template-columns:repeat(5,1fr);gap:4px;text-align:center">
+      <div><div style="color:#94a3b8;font-size:.75em">PV</div><div id="ns-pv" style="color:#4ade80"></div></div>
+      <div><div style="color:#94a3b8;font-size:.75em">Load</div><div id="ns-load" style="color:#fb923c"></div></div>
+      <div><div style="color:#94a3b8;font-size:.75em">Grid import</div><div id="ns-grid" style="color:#f87171"></div></div>
+      <div><div style="color:#94a3b8;font-size:.75em">Battery SoC</div><div id="ns-soc" style="color:#60a5fa"></div></div>
+      <div><div style="color:#94a3b8;font-size:.75em">DHW</div><div id="ns-dhw" style="color:#fb923c"></div></div>
+    </div>
+  </div>
   <div class="cw">
     <div class="ct">Energy flows per 30-min slot</div>
     <div class="legend">
-      <span><span class="dot" style="background:#4ade80"></span>PV generation</span>
-      <span><span class="dot" style="background:#fb923c"></span>Total load</span>
+      <span style="color:#64748b;font-size:.75em;margin-right:6px">&#8213; Plan &nbsp; &#8212; Actual</span>
+      <span><span class="dot" style="background:#4ade80"></span>PV</span>
+      <span><span class="dot" style="background:#fb923c"></span>Load</span>
       <span><span class="dot" style="background:#f87171;opacity:.7"></span>Grid import</span>
-      <span><span class="dot" style="background:#4ade80;opacity:.4"></span>Grid export</span>
     </div>
     <canvas id="ce" height="130"></canvas>
   </div>
   <div class="cw">
     <div class="ct">Battery SoC &amp; DHW temperature</div>
+    <div class="legend">
+      <span style="color:#64748b;font-size:.75em;margin-right:6px">&#8213; Plan &nbsp; &#8212; Actual</span>
+      <span><span class="dot" style="background:#60a5fa"></span>SoC</span>
+      <span><span class="dot" style="background:#fb923c"></span>DHW</span>
+    </div>
     <canvas id="ct" height="95"></canvas>
   </div>
   <div id="plan-msg"></div>
@@ -407,7 +422,10 @@ function renderAssumptions(d){
 
 async function loadPlan(){
   try{
-    const d=await fetch('schedule').then(r=>r.json());
+    const [d, act] = await Promise.all([
+      fetch('schedule').then(r=>r.json()),
+      fetch('actual-today').then(r=>r.json()).catch(()=>null)
+    ]);
     if(!d.slots||!d.slots.length){
       document.getElementById('plan-msg').innerHTML='<p class="msg">No plan yet — waiting for first replan</p>';
       return;
@@ -420,32 +438,81 @@ async function loadPlan(){
       ticks:{color:clr,font:{size:10}},grid:{color:pos==='left'?'#1a2640':undefined,drawOnChartArea:pos==='left'},
       title:{display:true,text:lbl,color:clr,font:{size:10}}
     });
+    const w2k=v=>v!=null?Math.round(v/2)/1000:null;
+
     if(eChart)eChart.destroy();
+    const eDS=[
+      {type:'bar',label:'PV (plan)',data:s.map(x=>x.pv_kwh),backgroundColor:'rgba(74,222,128,.35)',borderColor:'#4ade80',borderWidth:.5,order:5},
+      {type:'bar',label:'Load (plan)',data:s.map(x=>x.total_load_kwh),backgroundColor:'rgba(251,146,60,.3)',borderColor:'#fb923c',borderWidth:.5,order:6},
+      {type:'line',label:'Grid import (plan)',data:s.map(x=>x.grid_import_kwh),borderColor:'rgba(248,113,113,.5)',borderDash:[4,3],tension:.3,pointRadius:0,borderWidth:1,order:3},
+      {type:'line',label:'Grid export',data:s.map(x=>x.grid_export_kwh),borderColor:'rgba(74,222,128,.4)',borderDash:[3,3],tension:.3,pointRadius:0,borderWidth:1,order:4},
+    ];
+    if(act){
+      eDS.push({type:'line',label:'PV (actual)',data:act.pv_w.map(w2k),borderColor:'#4ade80',tension:.3,pointRadius:0,borderWidth:2,order:2});
+      eDS.push({type:'line',label:'Load (actual)',data:act.load_w.map(w2k),borderColor:'#fb923c',tension:.3,pointRadius:0,borderWidth:2,order:2});
+      eDS.push({type:'line',label:'Grid import (actual)',data:act.grid_import_w.map(w2k),borderColor:'#f87171',backgroundColor:'rgba(248,113,113,.15)',fill:true,tension:.3,pointRadius:0,borderWidth:2,order:1});
+    }
     eChart=new Chart(document.getElementById('ce').getContext('2d'),{
-      data:{labels:SL,datasets:[
-        {type:'bar',label:'PV',data:s.map(x=>x.pv_kwh),backgroundColor:'rgba(74,222,128,.5)',borderColor:'#4ade80',borderWidth:.5,order:3},
-        {type:'bar',label:'Load',data:s.map(x=>x.total_load_kwh),backgroundColor:'rgba(251,146,60,.4)',borderColor:'#fb923c',borderWidth:.5,order:4},
-        {type:'line',label:'Grid import',data:s.map(x=>x.grid_import_kwh),borderColor:'#f87171',backgroundColor:'rgba(248,113,113,.15)',fill:true,tension:.3,pointRadius:0,borderWidth:1.5,order:1},
-        {type:'line',label:'Grid export',data:s.map(x=>x.grid_export_kwh),borderColor:'#4ade80',borderDash:[3,3],tension:.3,pointRadius:0,borderWidth:1,order:2},
-      ]},
+      data:{labels:SL,datasets:eDS},
       options:{...CO,scales:{...CO.scales,y:{ticks:{color:'#64748b',font:{size:10}},grid:{color:'#1a2640'},title:{display:true,text:'kWh',color:'#64748b',font:{size:10}}}}}
     });
+
     if(tChart)tChart.destroy();
+    const tDS=[
+      {label:'SoC % (plan)',data:s.map(x=>x.soc_pct),borderColor:'rgba(96,165,250,.45)',borderDash:[4,3],tension:.4,pointRadius:0,borderWidth:1.5,yAxisID:'soc'},
+      {label:'DHW °C (plan)',data:s.map(x=>x.dhw_temp_c),borderColor:'rgba(251,146,60,.45)',borderDash:[4,3],tension:.4,pointRadius:0,borderWidth:1.5,yAxisID:'dhw'},
+    ];
+    if(act){
+      tDS.push({label:'SoC % (actual)',data:act.soc_pct,borderColor:'#60a5fa',backgroundColor:'rgba(96,165,250,.1)',fill:true,tension:.4,pointRadius:0,borderWidth:2,yAxisID:'soc'});
+      tDS.push({label:'DHW °C (actual)',data:act.dhw_temp_c,borderColor:'#fb923c',tension:.4,pointRadius:0,borderWidth:2,yAxisID:'dhw'});
+    }
     tChart=new Chart(document.getElementById('ct').getContext('2d'),{
       type:'line',
-      data:{labels:SL,datasets:[
-        {label:'SoC %',data:s.map(x=>x.soc_pct),borderColor:'#60a5fa',backgroundColor:'rgba(96,165,250,.1)',fill:true,tension:.4,pointRadius:0,yAxisID:'soc'},
-        {label:'DHW °C',data:s.map(x=>x.dhw_temp_c),borderColor:'#fb923c',borderDash:[4,3],tension:.4,pointRadius:0,borderWidth:1.5,yAxisID:'dhw'},
-      ]},
+      data:{labels:SL,datasets:tDS},
       options:{...CO,plugins:{...CO.plugins,legend:{display:true,labels:{color:'#e2e8f0',font:{family:'monospace',size:11},boxWidth:10}}},
         scales:{...CO.scales,soc:yAx('soc','left','#60a5fa',0,105,'SoC %'),dhw:yAx('dhw','right','#fb923c',35,65,'DHW °C')}}
     });
+
     const now=new Date();
     const cur=now.getHours()*2+(now.getMinutes()>=30?1:0);
+
+    if(act){
+      const sl=act.current_slot,ps=s[sl]||{};
+      const fW=v=>v!=null?Math.round(v)+'W':'—';
+      const fP=v=>v!=null?v.toFixed(1)+'%':'—';
+      const fT=v=>v!=null?v.toFixed(1)+'°':'—';
+      const delta=(a,p,hi)=>{
+        if(a==null||p==null)return '';
+        const d=a-p,clr=(hi?d>0:d<0)?'#4ade80':'#f87171';
+        return ` <span style="color:${clr}">${d>=0?'+':''}${Math.round(d)}${hi?'W':'W'}</span>`;
+      };
+      const deltaP=(a,p)=>{
+        if(a==null||p==null)return '';
+        const d=a-p,clr=Math.abs(d)<3?'#94a3b8':d>0?'#4ade80':'#f87171';
+        return ` <span style="color:${clr}">${d>=0?'+':''}${d.toFixed(1)}pp</span>`;
+      };
+      const deltaT=(a,p)=>{
+        if(a==null||p==null)return '';
+        const d=a-p,clr=Math.abs(d)<1?'#94a3b8':d>0?'#4ade80':'#f87171';
+        return ` <span style="color:${clr}">${d>=0?'+':''}${d.toFixed(1)}°</span>`;
+      };
+      const planPvW=ps.pv_kwh!=null?ps.pv_kwh*2000:null;
+      const planLdW=ps.total_load_kwh!=null?ps.total_load_kwh*2000:null;
+      const planGiW=ps.grid_import_kwh!=null?ps.grid_import_kwh*2000:null;
+      const h=Math.floor(sl/2),m=sl%2===0?'00':'30';
+      document.getElementById('now-slot-label').textContent=`${String(h).padStart(2,'0')}:${m}`;
+      document.getElementById('ns-pv').innerHTML=`P:${fW(planPvW)}<br>A:${fW(act.pv_w[sl])}${delta(act.pv_w[sl],planPvW,true)}`;
+      document.getElementById('ns-load').innerHTML=`P:${fW(planLdW)}<br>A:${fW(act.load_w[sl])}${delta(act.load_w[sl],planLdW,false)}`;
+      document.getElementById('ns-grid').innerHTML=`P:${fW(planGiW)}<br>A:${fW(act.grid_import_w[sl])}${delta(act.grid_import_w[sl],planGiW,false)}`;
+      document.getElementById('ns-soc').innerHTML=`P:${fP(ps.soc_pct)}<br>A:${fP(act.soc_pct[sl])}${deltaP(act.soc_pct[sl],ps.soc_pct)}`;
+      document.getElementById('ns-dhw').innerHTML=`P:${fT(ps.dhw_temp_c)}<br>A:${fT(act.dhw_temp_c[sl])}${deltaT(act.dhw_temp_c[sl],ps.dhw_temp_c)}`;
+      document.getElementById('now-strip').style.display='block';
+    }
+
     document.getElementById('pt').innerHTML=s.map((x,i)=>{
       const gi=x.grid_import_kwh>.002?`<span style="color:#f87171">+${x.grid_import_kwh.toFixed(3)}</span>`:
                x.grid_export_kwh>.002?`<span style="color:#4ade80">−${x.grid_export_kwh.toFixed(3)}</span>`:'—';
-      const act=x.dhw_heat_kwh>.01?'<span style="color:#a78bfa">DHW heat</span>':
+      const actLbl=x.dhw_heat_kwh>.01?'<span style="color:#a78bfa">DHW heat</span>':
                 x.precharge_w>10?'<span style="color:#fbbf24">Bat chg</span>':'—';
       return `<tr class="${x.is_peak?'pk':''}${i===cur?' now':''}">
         <td>${x.time}</td>
@@ -455,7 +522,7 @@ async function loadPlan(){
         <td>${gi}</td>
         <td style="color:#60a5fa">${x.soc_pct.toFixed(0)}</td>
         <td style="color:#fb923c">${x.dhw_temp_c.toFixed(1)}</td>
-        <td>${act}</td></tr>`;
+        <td>${actLbl}</td></tr>`;
     }).join('');
     const rows=document.getElementById('pt').querySelectorAll('tr');
     if(rows[cur])rows[cur].scrollIntoView({block:'center'});
@@ -641,6 +708,38 @@ async def schedule() -> JSONResponse:
             "precharge_w": round(result.offpeak_precharge_w[t], 0),
         })
     return JSONResponse({"slots": slots})
+
+
+@app.get("/actual-today")
+def actual_today() -> JSONResponse:
+    """Return today's actual sensor data resampled to 48 half-hour slots. Sync: HA history API call."""
+    ha = _state.get("ha")
+    if ha is None:
+        raise HTTPException(status_code=503, detail="Not ready")
+
+    entity_ids = [
+        "sensor.inverter_input_power",
+        "sensor.house_consumption_power",
+        "sensor.battery_state_of_capacity",
+        "sensor.power_meter_active_power",
+        "sensor.heiko_hot_water_dhw_temperature",
+    ]
+    hist = ha.get_history_today_30min(entity_ids)
+
+    # Sign-correct grid: power_meter_active_power positive=export, negative=import
+    raw_grid = hist.get("sensor.power_meter_active_power", [None] * 48)
+    grid_import_w = [round(max(0.0, -v), 1) if v is not None else None for v in raw_grid]
+
+    now_slot = ha.local_now.hour * 2 + ha.local_now.minute // 30
+
+    return JSONResponse({
+        "current_slot": now_slot,
+        "pv_w": hist.get("sensor.inverter_input_power", [None] * 48),
+        "load_w": hist.get("sensor.house_consumption_power", [None] * 48),
+        "soc_pct": hist.get("sensor.battery_state_of_capacity", [None] * 48),
+        "grid_import_w": grid_import_w,
+        "dhw_temp_c": hist.get("sensor.heiko_hot_water_dhw_temperature", [None] * 48),
+    })
 
 
 @app.get("/history")

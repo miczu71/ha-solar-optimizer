@@ -5,6 +5,17 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [0.3.6] — 2026-04-25
+
+### Added
+- **Plan-vs-reality overlay in the add-on web UI (Today's Plan tab)**:
+  - Both charts (Energy flows and Battery SoC / DHW) now show dashed plan lines alongside solid actual-sensor lines for PV, load, grid import, SoC, and DHW temperature.
+  - **Current-slot strip** (`#now-strip`) appears at the top of the plan panel showing Plan / Actual / Δ for all 5 metrics (PV, Load, Grid import, Battery SoC, DHW temperature) for the current 30-min slot.
+  - Actual data is fetched from the new `/actual-today` endpoint which reads HA's history API and resamples to 48 half-hour averages.
+- **`/actual-today` REST endpoint**: returns today's resampled 48-slot arrays for PV power (W), house load (W), grid import (W, sign-corrected), battery SoC (%), and DHW temperature (°C). Called client-side on every plan panel load.
+
+---
+
 ## [0.3.5] — 2026-04-25
 
 ### Added
