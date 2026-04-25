@@ -5,6 +5,18 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [0.3.4] — 2026-04-25
+
+### Fixed
+- **Today's Plan tab blank** — `/schedule` API endpoint crashed with
+  `AttributeError: 'OptimizeResult' object has no attribute 'pv_forecast_kwh'`
+  (also `base_load_kwh` and `is_peak`). These per-slot input arrays were referenced
+  in `api.py` but never added to the `OptimizeResult` dataclass. Added all three as
+  optional fields (default empty list) and populate them from the optimizer inputs
+  on every successful solve.
+
+---
+
 ## [0.3.3] — 2026-04-25
 
 ### Fixed

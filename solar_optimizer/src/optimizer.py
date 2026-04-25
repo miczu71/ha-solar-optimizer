@@ -55,6 +55,10 @@ class OptimizeResult:
     objective_value: Optional[float] = None
     pv_forecast_kwh_total: float = 0.0
     load_forecast_kwh_total: float = 0.0
+    # Per-slot input arrays — stored for API and history consumers
+    pv_forecast_kwh: list[float] = field(default_factory=list)
+    base_load_kwh: list[float] = field(default_factory=list)
+    is_peak: list[bool] = field(default_factory=list)
 
 
 def run_optimizer(
@@ -248,4 +252,7 @@ def run_optimizer(
         objective_value=pulp.value(prob.objective),
         pv_forecast_kwh_total=sum(pv_forecast_kwh),
         load_forecast_kwh_total=sum(base_load_kwh),
+        pv_forecast_kwh=list(pv_forecast_kwh),
+        base_load_kwh=list(base_load_kwh),
+        is_peak=list(is_peak),
     )
