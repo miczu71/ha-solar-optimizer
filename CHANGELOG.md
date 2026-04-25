@@ -5,6 +5,19 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [0.3.3] — 2026-04-25
+
+### Fixed
+- **LP Infeasible when DHW control is disabled** — when `switch.optimizer_dhw_control` is OFF,
+  the DHW temperature LP variables (`dhwt_0..48`) have no heating term but still have
+  `lowBound = dhw_comfort_min − 5 = 40°C`. The forced loss of `0.4°C/slot` means by slot 13
+  the temperature hits the lower bound → infeasible. Fix: lower bound is relaxed to `0` when
+  `enable_dhw=False`, and `dhw_temp_init` is clamped to the valid range (same pattern already
+  used for `soc_init`). Previously the optimizer produced "Infeasible" on every replan and
+  self-disabled after 3 consecutive failures.
+
+---
+
 ## [0.3.2] — 2026-04-25
 
 ### Fixed

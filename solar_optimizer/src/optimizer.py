@@ -92,6 +92,23 @@ def run_optimizer(
 
     # Clamp initial SoC to valid range
     soc_init_kwh = min(soc_max_kwh, max(soc_min_kwh, soc_init * bat_cap_kwh / 100))
+    if soc_init * bat_cap_kwh / 100 != soc_init_kwh:
+        log.warning(
+            "SoC %.1f%% (%.3f kWh) outside LP bounds [%.1f%%, %.1f%%] -- clamped to %.3f kWh",
+            soc_init, soc_init * bat_cap_kwh / 100,
+            max(cfg.soc_min_percent, soc_min), cfg.soc_max_percent, soc_init_kwh,
+        )
+
+    # When DHW is disabled, LP has no heating term so the tank temp is forced to
+    # drop loss_rate/slot — if that pushes it below the variable lower bound the
+    # LP becomes infeasible.  Relax the lower bound to 0 when DHW is off.
+    dhw_temp_lb = (cfg.dhw_comfort_min - 5) if enable_dhw else 0.0
+    dhw_temp_init_clamped = min(cfg.dhw_max_temp + 2, max(dhw_temp_lb, dhw_temp_init))
+    if dhw_temp_init_clamped != dhw_temp_init:
+        log.warning(
+            "DHW temp %.1f°C outside LP bounds [%.1f, %.1f] -- clamped to %.1f",
+            dhw_temp_init, dhw_temp_lb, cfg.dhw_max_temp + 2, dhw_temp_init_clamped,
+        )
 
     prob = pulp.LpProblem("solar_optimizer", pulp.LpMinimize)
 
@@ -115,7 +132,7 @@ def run_optimizer(
     bat_to_load = [pulp.LpVariable(f"b2l_{t}", lowBound=0) for t in range(SLOTS)]
     soc = [pulp.LpVariable(f"soc_{t}", lowBound=soc_min_kwh, upBound=soc_max_kwh)
            for t in range(SLOTS + 1)]
-    dhw_temp = [pulp.LpVariable(f"dhwt_{t}", lowBound=cfg.dhw_comfort_min - 5,
+    dhw_temp = [pulp.LpVariable(f"dhwt_{t}", lowBound=dhw_temp_lb,
                                  upBound=cfg.dhw_max_temp + 2)
                 for t in range(SLOTS + 1)]
 
@@ -148,7 +165,7 @@ def run_optimizer(
 
     # ---- initial conditions -------------------------------------------------
     prob += soc[0] == soc_init_kwh
-    prob += dhw_temp[0] == dhw_temp_init
+    prob += dhw_temp[0] == dhw_temp_init_clamped
 
     for t in range(SLOTS):
         pv = pv_forecast_kwh[t]
