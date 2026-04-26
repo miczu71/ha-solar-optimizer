@@ -59,6 +59,9 @@ class OptimizeResult:
     pv_forecast_kwh: list[float] = field(default_factory=list)
     base_load_kwh: list[float] = field(default_factory=list)
     is_peak: list[bool] = field(default_factory=list)
+    # Per-slot LP solution arrays for charge-source breakdown
+    pv_to_battery_kwh: list[float] = field(default_factory=list)
+    bat_to_load_kwh: list[float] = field(default_factory=list)
 
 
 def run_optimizer(
@@ -255,4 +258,6 @@ def run_optimizer(
         pv_forecast_kwh=list(pv_forecast_kwh),
         base_load_kwh=list(base_load_kwh),
         is_peak=list(is_peak),
+        pv_to_battery_kwh=[v(pv_to_bat[t]) for t in range(SLOTS)],
+        bat_to_load_kwh=[v(bat_to_load[t]) for t in range(SLOTS)],
     )

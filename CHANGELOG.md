@@ -5,6 +5,15 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [0.3.7] — 2026-04-26
+
+### Added
+- **Battery charge source breakdown chart** (Today's Plan tab): new stacked bar chart below the SoC/DHW chart showing, per 30-min slot, how much energy flows from PV surplus into the battery (green), from forced grid precharge (yellow), and back out as discharge to load (red, negative). Uses exact LP solution values (`pv_to_battery_kwh`, `bat_to_load_kwh`) now exposed via `/schedule`.
+- **Head-to-head comparison table** (Compare tab): new H2H table above the JIT/Optimizer detail cards comparing both systems side-by-side on 8 key metrics (SoC now, EOD SoC, this-slot charge power, PV forecast, load forecast, grid import, precharge total, DHW heat). Rows with comparable numeric values show a coloured "▲ OPT / ▲ JIT" winner badge with a 3% tolerance band for near-equal values.
+- `OptimizeResult` fields `pv_to_battery_kwh` and `bat_to_load_kwh` (exact LP solution values, per slot); both exposed in `/schedule` endpoint.
+
+---
+
 ## [0.3.6] — 2026-04-25
 
 ### Added

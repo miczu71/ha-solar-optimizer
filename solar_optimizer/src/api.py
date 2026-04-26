@@ -283,6 +283,15 @@ details summary:hover{color:var(--t)}
     </div>
     <canvas id="ct" height="95"></canvas>
   </div>
+  <div class="cw">
+    <div class="ct">Battery charging — source per 30-min slot (planned)</div>
+    <div class="legend">
+      <span><span class="dot" style="background:#4ade80"></span>From PV surplus</span>
+      <span><span class="dot" style="background:#fbbf24"></span>From grid (precharge)</span>
+      <span><span class="dot" style="background:#f87171"></span>Discharge to load</span>
+    </div>
+    <canvas id="cb" height="80"></canvas>
+  </div>
   <div id="plan-msg"></div>
   <div style="overflow-x:auto">
     <table>
@@ -312,9 +321,13 @@ details summary:hover{color:var(--t)}
     <button class="btn-sm" onclick="loadCompare()">&#8635; Refresh</button>
   </div>
   <div id="compare-msg"><p class="msg">&#9432; Loading&hellip;</p></div>
+  <div class="cw" id="h2h-wrap" style="display:none">
+    <div class="ct">Head-to-head &mdash; JIT vs Optimizer</div>
+    <div id="h2h-table"></div>
+  </div>
   <div class="grid2">
-    <div class="cw"><div class="ct">JIT Battery Control (existing automation)</div><div id="jit-card"></div></div>
-    <div class="cw"><div class="ct">Solar Optimizer (shadow plan)</div><div id="opt-card"></div></div>
+    <div class="cw"><div class="ct" style="color:#fbbf24">JIT — current analysis</div><div id="jit-card"></div></div>
+    <div class="cw"><div class="ct" style="color:#60a5fa">Optimizer — 24h plan</div><div id="opt-card"></div></div>
   </div>
   <div class="cw" id="cc-wrap" style="display:none">
     <div class="ct">SoC trajectory comparison</div>
@@ -347,7 +360,7 @@ details summary:hover{color:var(--t)}
 </div>
 
 <script>
-let eChart=null,tChart=null,cChart=null,planLoaded=false,histLoaded=false,_retryTimer=null;
+let eChart=null,tChart=null,bChart=null,cChart=null,planLoaded=false,histLoaded=false,_retryTimer=null;
 const SL=Array.from({length:48},(_,i)=>`${String(i>>1).padStart(2,'0')}:${i&1?'30':'00'}`);
 const CO={responsive:true,interaction:{intersect:false,mode:'index'},
   plugins:{legend:{display:false},
@@ -473,6 +486,18 @@ async function loadPlan(){
         scales:{...CO.scales,soc:yAx('soc','left','#60a5fa',0,105,'SoC %'),dhw:yAx('dhw','right','#fb923c',35,65,'DHW °C')}}
     });
 
+    if(bChart)bChart.destroy();
+    bChart=new Chart(document.getElementById('cb').getContext('2d'),{
+      type:'bar',
+      data:{labels:SL,datasets:[
+        {label:'PV→Bat',data:s.map(x=>x.pv_to_battery_kwh||0),backgroundColor:'rgba(74,222,128,.65)',borderColor:'#4ade80',borderWidth:.5,stack:'chg'},
+        {label:'Grid→Bat',data:s.map(x=>(x.precharge_w||0)*0.5/1000),backgroundColor:'rgba(251,191,36,.65)',borderColor:'#fbbf24',borderWidth:.5,stack:'chg'},
+        {label:'Bat→Load',data:s.map(x=>-(x.bat_to_load_kwh||0)),backgroundColor:'rgba(248,113,113,.55)',borderColor:'#f87171',borderWidth:.5,stack:'dch'},
+      ]},
+      options:{...CO,plugins:{...CO.plugins,legend:{display:true,labels:{color:'#e2e8f0',font:{family:'monospace',size:11},boxWidth:10}}},
+        scales:{...CO.scales,y:{ticks:{color:'#64748b',font:{size:10}},grid:{color:'#1a2640'},title:{display:true,text:'kWh',color:'#64748b',font:{size:10}}}}}
+    });
+
     const now=new Date();
     const cur=now.getHours()*2+(now.getMinutes()>=30?1:0);
 
@@ -558,6 +583,8 @@ async function loadCompare(){
   document.getElementById('compare-msg').innerHTML='<p class="msg">&#8987; Reading live HA sensors…</p>';
   document.getElementById('jit-card').innerHTML='';
   document.getElementById('opt-card').innerHTML='';
+  document.getElementById('h2h-wrap').style.display='none';
+  document.getElementById('h2h-table').innerHTML='';
   document.getElementById('cc-wrap').style.display='none';
   document.getElementById('ctab').innerHTML='';
   try{
@@ -569,6 +596,49 @@ async function loadCompare(){
     function mkT(rows){
       return '<table><tbody>'+rows.map(([k,v])=>`<tr><td style="color:#94a3b8;width:52%;padding:4px 8px;white-space:normal">${k}</td><td style="padding:4px 8px">${v}</td></tr>`).join('')+'</tbody></table>';
     }
+    // ── Head-to-head table ──────────────────────────────────────────────────
+    (()=>{
+      const fmt=(v,unit,dec=1)=>v!=null?`${typeof v==='number'?v.toFixed(dec):v}${unit}`:'—';
+      const winner=(jv,ov,hiGood)=>{
+        if(jv==null||ov==null)return '—';
+        const tol=Math.max(Math.abs(jv)*0.03,0.3);
+        if(Math.abs(ov-jv)<=tol)return '<span style="color:#94a3b8">≈</span>';
+        const optBetter=hiGood?ov>jv:ov<jv;
+        return optBetter
+          ?'<span style="color:#60a5fa">▲ OPT</span>'
+          :'<span style="color:#fbbf24">▲ JIT</span>';
+      };
+      const rows=[
+        ['SoC now',             fmt(j.soc_now,'%',0),         fmt(o.soc_now,'%',0),          winner(j.soc_now,o.soc_now,true)],
+        ['EOD SoC',
+          `${fmt(j.target_soc_pct,'%',0)} <span style="color:#475569;font-size:.8em">(target)</span>`,
+          `${fmt(o.soc_eod_pct,'%',0)} <span style="color:#475569;font-size:.8em">(predicted)</span>`,
+          winner(j.target_soc_pct,o.soc_eod_pct,true)],
+        ['This slot: charge W', fmt(j.req_power_w,' W',0),    fmt(o.current_slot_precharge_w,' W',0), winner(j.req_power_w,o.current_slot_precharge_w,false)],
+        ['PV forecast 24h',     fmt(j.forecast_kwh,' kWh',1), fmt(o.pv_forecast_24h_kwh,' kWh',1),    winner(j.forecast_kwh,o.pv_forecast_24h_kwh,true)],
+        ['Load forecast 24h',   '—',                           fmt(o.load_forecast_24h_kwh,' kWh',1),  '—'],
+        ['Grid import 24h',     '—',                           o.grid_import_total_kwh!=null?`<span style="color:#f87171">${o.grid_import_total_kwh.toFixed(2)} kWh</span>`:'—', '—'],
+        ['Precharge total',     '—',                           fmt(o.precharge_total_kwh,' kWh',2),    '—'],
+        ['DHW heat total',      '—',                           `<span style="color:#a78bfa">${fmt(o.dhw_heat_total_kwh,' kWh',2)}</span>`, '—'],
+      ];
+      document.getElementById('h2h-table').innerHTML=
+        '<table><thead><tr>'+
+        '<th style="text-align:left">Metric</th>'+
+        '<th style="color:#fbbf24">JIT</th>'+
+        '<th style="color:#60a5fa">Optimizer</th>'+
+        '<th>Better</th>'+
+        '</tr></thead><tbody>'+
+        rows.map(([m,jv,ov,w])=>
+          `<tr><td style="color:#94a3b8;padding:4px 8px">${m}</td>`+
+          `<td style="padding:4px 8px">${jv}</td>`+
+          `<td style="padding:4px 8px">${ov}</td>`+
+          `<td style="padding:4px 8px;text-align:center">${w}</td></tr>`
+        ).join('')+
+        '</tbody></table>';
+      document.getElementById('h2h-wrap').style.display='block';
+    })();
+    // ───────────────────────────────────────────────────────────────────────
+
     const calT=j.calendar_today==='workday'?'&#127970; Work':'&#127958; Off';
     const calTom=j.calendar_tomorrow==='workday'?'&#127970; Work':'&#127958; Off';
     document.getElementById('jit-card').innerHTML=mkT([
@@ -693,6 +763,8 @@ async def schedule() -> JSONResponse:
         base = result.base_load_kwh[t] if result.base_load_kwh else 0.0
         dhw_heat = result.dhw_heat_energy[t]
         total_load = base + dhw_heat / cop
+        pv_to_bat = result.pv_to_battery_kwh[t] if result.pv_to_battery_kwh else 0.0
+        bat_to_ld = result.bat_to_load_kwh[t] if result.bat_to_load_kwh else 0.0
         slots.append({
             "slot": t,
             "time": f"{h:02d}:{m:02d}",
@@ -706,6 +778,8 @@ async def schedule() -> JSONResponse:
             "soc_pct": round(result.soc_trajectory[t], 1),
             "dhw_temp_c": round(result.dhw_temp_trajectory[t], 1),
             "precharge_w": round(result.offpeak_precharge_w[t], 0),
+            "pv_to_battery_kwh": round(pv_to_bat, 4),
+            "bat_to_load_kwh": round(bat_to_ld, 4),
         })
     return JSONResponse({"slots": slots})
 
