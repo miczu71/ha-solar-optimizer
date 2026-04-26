@@ -12,11 +12,6 @@ OPTIONS_PATH = Path(os.environ.get("OPTIONS_PATH", "/data/options.json"))
 class Config:
     ha_url: str = "http://supervisor/core"
     ha_token: str = field(default_factory=lambda: os.environ.get("SUPERVISOR_TOKEN", ""))
-    influx_host: str = "192.168.0.105"
-    influx_port: int = 8086
-    influx_database: str = "homeassistant"
-    influx_username: str = "homeassistant"
-    influx_password: str = ""
     mqtt_host: str = "core-mosquitto"
     mqtt_port: int = 1883
     mqtt_username: str = ""
@@ -39,18 +34,14 @@ class Config:
     legionella_hours: int = 24
     ml_enabled: bool = True
     shadow_mode: bool = True
-    # Polish public holiday awareness — reads HA workday binary_sensor
     workday_entity: str = "binary_sensor.workday"
     workday_tomorrow_entity: str = "binary_sensor.workday_tomorrow"
-    # Comfort profiles: DHW demand window shifts on weekends/holidays
-    dhw_demand_hour_weekday: int = 7   # comfort floor enforced from this hour on workdays
-    dhw_demand_hour_weekend: int = 9   # comfort floor enforced from this hour on weekends/holidays
-    # Manual override entities (set from HA Lovelace)
+    dhw_demand_hour_weekday: int = 7
+    dhw_demand_hour_weekend: int = 9
     force_soc_entity: str = "input_number.optimizer_force_soc_target"
     force_soc_deadline_entity: str = "input_number.optimizer_force_soc_deadline_hour"
     vacation_mode_entity: str = "input_boolean.optimizer_vacation_mode"
     vacation_dhw_setpoint_entity: str = "input_number.optimizer_vacation_dhw_setpoint"
-    # Deferrable loads — list of {name, power_w, duration_min, earliest_slot, latest_slot}
     deferrable_loads: list = field(default_factory=list)
 
     @classmethod

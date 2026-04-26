@@ -796,7 +796,7 @@ def actual_today() -> JSONResponse:
         "sensor.house_consumption_power",
         "sensor.battery_state_of_capacity",
         "sensor.power_meter_active_power",
-        "sensor.heiko_hot_water_dhw_temperature",
+        "sensor.heiko_heat_pump_water_temperature",
     ]
     hist = ha.get_history_today_30min(entity_ids)
 
@@ -850,7 +850,11 @@ def compare() -> JSONResponse:
     jit = _compute_jit_status(ha, cfg)
 
     now_local = ha.local_now
-    is_peak = g12w_peak_vector(now_local)
+    try:
+        _is_workday = ha.is_workday(cfg.workday_entity)
+    except Exception:
+        _is_workday = True
+    is_peak = g12w_peak_vector(now_local, _is_workday)
     soc_now = jit["soc_now"]
     current_slot = now_local.hour * 2 + now_local.minute // 30
 

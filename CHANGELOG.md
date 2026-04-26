@@ -5,6 +5,26 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [0.3.11] — 2026-04-26
+
+### Fixed
+- **Compare tab crash** (critical): `g12w_peak_vector()` in the `/compare` endpoint was called without the required `is_workday` argument (added in v0.3.8). Every visit to the Compare tab triggered a `TypeError` and a 500 response. Fixed by reading workday state before calling the function.
+- **DHW entity mismatch in plan-vs-reality overlay**: `/actual-today` was fetching `sensor.heiko_hot_water_dhw_temperature` (nonexistent) instead of the correct `sensor.heiko_heat_pump_water_temperature`.
+
+### Removed
+- **InfluxDB dependency eliminated**: All InfluxDB queries, `influx_client.py`, and the `influxdb` Python package have been removed. The optimizer now reads historical data exclusively from HA long-term statistics (SQLite recorder DB mounted at `/config`).
+  - Phase 1 rolling mean base load now uses HA long-term statistics per-slot means (7-day window) instead of falling back to a flat 0.3 kWh/slot.
+  - Phase 2 LightGBM lag features (1-day, 7-day) and PV-yesterday also computed from HA statistics.
+  - Deferrable load already-ran detection uses HA history API only (`device_ran_today_ha()`).
+  - DHW thermal auto-calibration (InfluxDB-only, weekly) removed; `dhw_loss_rate_c_per_hour` and `dhw_cop` config defaults remain authoritative.
+  - `influx_host`, `influx_port`, `influx_database`, `influx_username`, `influx_password` removed from `config.yaml` options and schema.
+
+### Changed
+- Deferrable load pattern learning (power_w, duration_min inference from history) removed; config-specified values are used directly.
+- Weekly pattern-refresh and thermal-calibration scheduler jobs removed.
+
+---
+
 ## [0.3.10] — 2026-04-26
 
 ### Fixed

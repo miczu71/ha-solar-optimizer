@@ -1,6 +1,6 @@
 name: "Solar Optimizer"
 description: "EMHASS-like ML energy optimizer for Huawei solar+battery, heat pump DHW, and Midea AC dispatch"
-version: "0.3.10"
+version: "0.3.11"
 slug: "solar_optimizer"
 init: false
 arch:
@@ -18,11 +18,6 @@ map:
 
 options:
   ha_url: "http://supervisor/core"
-  influx_host: "192.168.0.105"
-  influx_port: 8086
-  influx_database: "homeassistant"
-  influx_username: "homeassistant"
-  influx_password: ""
   mqtt_host: "core-mosquitto"
   mqtt_port: 1883
   mqtt_username: ""
@@ -57,11 +52,6 @@ options:
 
 schema:
   ha_url: str
-  influx_host: str
-  influx_port: int(1024,65535)
-  influx_database: str
-  influx_username: str
-  influx_password: password
   mqtt_host: str
   mqtt_port: int(1,65535)
   mqtt_username: str?
@@ -99,5 +89,4 @@ schema:
       earliest_slot: int?
       latest_slot: int?
       power_entity: str?
-      energy_entity: str?
       run_threshold_w: float?

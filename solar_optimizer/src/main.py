@@ -4,9 +4,10 @@ import logging
 import re
 import sys
 import threading
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
+import pandas as pd
 import uvicorn
 from apscheduler.schedulers.background import BackgroundScheduler
 
@@ -16,11 +17,10 @@ from data_pipeline import build_forecast_row, build_training_features_ha_stats
 from executor import Executor
 from forecaster import LoadForecaster
 from ha_client import HAClient
-from influx_client import InfluxClient
+from ha_statistics_client import get_ha_statistics_30min
 from mqtt_publisher import MQTTPublisher
 from optimizer import OptimizeResult, run_optimizer
-from thermal_calibrator import calibrate_dhw_params, load_params, save_params
-from thermal_model import DHWModel
+from thermal_calibrator import load_params
 
 logging.basicConfig(
     level=logging.INFO,
@@ -33,8 +33,7 @@ CONSECUTIVE_FAILURE_LIMIT = 3
 _consecutive_failures = 0
 _HISTORY_FILE = "/data/plan_history.jsonl"
 _HISTORY_MAX_RECORDS = 1440  # ~30 days at 48 replans/day
-_learned_params: dict = {}   # populated from /data/learned_params.json at startup / after calibration
-_load_patterns: dict = {}    # {load_name: {power_w, duration_min, typical_start_slot, ...}}
+_learned_params: dict = {}
 
 
 def _read_addon_version() -> str:
@@ -50,11 +49,7 @@ def _read_addon_version() -> str:
 
 
 def build_pv_forecast(ha: HAClient) -> list[float]:
-    """Parse Solcast detailedForecast into 48-slot kWh array.
-
-    Solcast pv_estimate is in kW (average power for the 30-min interval).
-    Multiply by 0.5 to convert to kWh per slot.
-    """
+    """Parse Solcast detailedForecast into 48-slot kWh array."""
     slots_raw = ha.get_solcast_forecast()
     by_slot: dict[int, float] = {}
     now_local = ha.local_now
@@ -69,60 +64,75 @@ def build_pv_forecast(ha: HAClient) -> list[float]:
                 continue
             slot = dt_local.hour * 2 + dt_local.minute // 30
             kw = float(entry.get("pv_estimate", entry.get("PvEstimate", 0)))
-            by_slot[slot] = kw * 0.5  # kW -> kWh per 30-min slot
+            by_slot[slot] = kw * 0.5
         except Exception:
             continue
     return [by_slot.get(s, 0.0) for s in range(48)]
 
 
-def _refresh_load_patterns(influx: InfluxClient, cfg: Config) -> dict:
-    """Learn device run patterns from InfluxDB (HA stats fallback built into influx_client)."""
-    if not cfg.deferrable_loads:
-        return {}
+def _rolling_mean_ha_stats(days_back: int = 7) -> pd.Series:
+    """Per-slot mean base load (kWh/slot) from HA long-term statistics."""
     try:
-        patterns = influx.learn_device_patterns(cfg.deferrable_loads)
-        log.info("Refreshed load patterns for %d devices", len(patterns))
-        return patterns
+        entity_ids = [
+            "sensor.house_consumption_power",
+            "sensor.heiko_heat_pump_electrical_power",
+            "sensor.miernik_energii_klimatyzacje_power_a",
+            "sensor.miernik_energii_klimatyzacje_power_b",
+        ]
+        stats = get_ha_statistics_30min(entity_ids, days_back=days_back)
+        if not stats:
+            return pd.Series(dtype=float)
+        empty = pd.Series(dtype=float)
+        house = stats.get("sensor.house_consumption_power", empty)
+        hp    = stats.get("sensor.heiko_heat_pump_electrical_power", empty)
+        ac_p  = stats.get("sensor.miernik_energii_klimatyzacje_power_a", empty)
+        ac_d  = stats.get("sensor.miernik_energii_klimatyzacje_power_b", empty)
+        df = pd.concat([house, hp, ac_p, ac_d], axis=1, join="outer").fillna(0)
+        df.columns = ["house", "hp", "ac_p", "ac_d"]
+        # W → kWh/30-min-slot; clip subtracted values at 0
+        df["base"] = ((df["house"] - df["hp"] - df["ac_p"] - df["ac_d"]).clip(lower=0)) * 0.5 / 1000
+        df["slot"] = df.index.hour * 2 + df.index.minute // 30
+        return df.groupby("slot")["base"].mean()
     except Exception as exc:
-        log.warning("Device pattern learning failed: %s", exc)
-        return {}
+        log.debug("HA stats rolling mean (%dd) failed: %s", days_back, exc)
+        return pd.Series(dtype=float)
+
+
+def _pv_total_yesterday_ha_stats(now_local: datetime) -> float:
+    """Yesterday's total PV generation (kWh) from HA long-term statistics."""
+    try:
+        stats = get_ha_statistics_30min(["sensor.inverter_input_power"], days_back=2)
+        pv_s = stats.get("sensor.inverter_input_power")
+        if pv_s is not None and not pv_s.empty:
+            yesterday = (now_local - timedelta(days=1)).date()
+            mask = pv_s.index.date == yesterday
+            if mask.any():
+                return float(pv_s[mask].sum() * 0.5 / 1000)
+    except Exception as exc:
+        log.debug("PV yesterday HA stats failed: %s", exc)
+    return 5.0
 
 
 def build_base_load_forecast(
-    influx: InfluxClient,
     forecaster: LoadForecaster,
     ha: HAClient,
     cfg: Config,
     now_local: datetime,
     phase: int,
 ) -> list[float]:
-    deferred_entities = [lc["power_entity"] for lc in cfg.deferrable_loads if "power_entity" in lc]
-
     if phase == 2 and forecaster.is_ready():
         try:
             outdoor = ha.outdoor_temp
-            lag_1d = {}
-            lag_7d = {}
-            pv_yesterday = 5.0
-            try:
-                lag_1d = influx.rolling_mean_base_load(days_back=1, deferrable_power_entities=deferred_entities)
-            except Exception as exc:
-                log.debug("lag_1d InfluxDB fetch failed: %s", exc)
-            try:
-                lag_7d = influx.rolling_mean_base_load(days_back=7, deferrable_power_entities=deferred_entities)
-            except Exception as exc:
-                log.debug("lag_7d InfluxDB fetch failed: %s", exc)
-            try:
-                pv_yesterday = influx.pv_total_yesterday()
-            except Exception as exc:
-                log.debug("pv_yesterday InfluxDB fetch failed: %s", exc)
+            lag_1d = _rolling_mean_ha_stats(days_back=1)
+            lag_7d = _rolling_mean_ha_stats(days_back=7)
+            pv_yesterday = _pv_total_yesterday_ha_stats(now_local)
             rows = [
                 build_forecast_row(
                     slot=s,
                     now=now_local,
                     outdoor_temp=outdoor,
-                    lag_1d=float(lag_1d.get(s, 0.3)),
-                    lag_7d=float(lag_7d.get(s, 0.3)),
+                    lag_1d=float(lag_1d.get(s, 0.3)) if not lag_1d.empty else 0.3,
+                    lag_7d=float(lag_7d.get(s, 0.3)) if not lag_7d.empty else 0.3,
                     pv_yesterday_kwh=pv_yesterday,
                 )
                 for s in range(48)
@@ -131,12 +141,11 @@ def build_base_load_forecast(
         except Exception as exc:
             log.warning("LightGBM forecast failed, falling back to rolling mean: %s", exc)
 
-    try:
-        rolling = influx.rolling_mean_base_load(days_back=7, deferrable_power_entities=deferred_entities)
+    rolling = _rolling_mean_ha_stats(days_back=7)
+    if not rolling.empty:
         return [float(rolling.get(s, 0.3)) for s in range(48)]
-    except Exception as exc:
-        log.warning("Rolling mean failed, using flat 0.3 kWh/slot: %s", exc)
-        return [0.3] * 48
+    log.warning("HA stats rolling mean empty, using flat 0.3 kWh/slot")
+    return [0.3] * 48
 
 
 def _find_best_deferrable_start(
@@ -167,7 +176,6 @@ def _find_best_deferrable_start(
 
 
 def _save_daily_summary(result: OptimizeResult, now_local: datetime, phase: int) -> None:
-    """Append a per-replan record to plan_history.jsonl for the history tab."""
     try:
         pv_total = sum(result.pv_forecast_kwh) if result.pv_forecast_kwh else result.pv_forecast_kwh_total
         export_total = sum(result.grid_export_kwh)
@@ -197,7 +205,6 @@ def _save_daily_summary(result: OptimizeResult, now_local: datetime, phase: int)
 def replan(
     cfg: Config,
     ha: HAClient,
-    influx: InfluxClient,
     executor: Executor,
     mqtt: MQTTPublisher,
     forecaster: LoadForecaster,
@@ -213,9 +220,8 @@ def replan(
         now_local = ha.local_now
 
         pv_forecast = build_pv_forecast(ha)
-        base_load = build_base_load_forecast(influx, forecaster, ha, cfg, now_local, phase)
+        base_load = build_base_load_forecast(forecaster, ha, cfg, now_local, phase)
 
-        # Store forecasts in state so /compare can build naive/JIT trajectory
         set_state("last_pv_forecast", pv_forecast)
         set_state("last_base_load", base_load)
 
@@ -226,15 +232,11 @@ def replan(
 
         slot = now_local.hour * 2 + now_local.minute // 30
 
-        # Read workday flag from HA (handles all Polish public holidays)
         is_workday = ha.is_workday(cfg.workday_entity)
 
-        # Comfort profile: shift DHW demand window on weekends/holidays
         demand_hour = cfg.dhw_demand_hour_weekday if is_workday else cfg.dhw_demand_hour_weekend
         demand_slot = demand_hour * 2
-
         dhw_demand_slots = [False] * 48
-        # Mark comfort window: demand_slot to demand_slot+4 (2h window)
         for t in range(demand_slot, min(48, demand_slot + 4)):
             dhw_demand_slots[t] = True
         if ha.bath_request:
@@ -243,7 +245,6 @@ def replan(
                 dhw_demand_slots[t] = True
             log.info("Bath requested: marking slots %d–%d as DHW demand", slot, demand_end - 1)
 
-        # Read manual overrides from HA input helpers
         force_soc_pct = ha.get_ha_float(cfg.force_soc_entity, default=0.0)
         force_soc_hour = int(ha.get_ha_float(cfg.force_soc_deadline_entity, default=8.0))
         vacation_mode = ha.get_ha_bool(cfg.vacation_mode_entity)
@@ -315,48 +316,32 @@ def replan(
         avoided = max(0.0, naive_import - sum(result.grid_import_kwh))
         mqtt.publish_grid_import_avoided(avoided)
 
-        # PLN savings vs naive baseline
         mqtt.publish_savings(result.savings_pln, result.optimized_cost_pln)
 
-        # Deferrable load scheduling (advisory — find best start window)
+        # Deferrable load scheduling (advisory)
         load_starts: list[tuple[str, str]] = []
         for load_cfg in cfg.deferrable_loads:
             name = load_cfg.get("name", "load")
             threshold_w = float(load_cfg.get("run_threshold_w", 50))
 
-            # Skip if device already ran today — check InfluxDB, fall back to HA history API
             already_ran = False
             if "power_entity" in load_cfg:
-                already_ran = influx.device_ran_today(load_cfg["power_entity"], threshold_w)
-                if not already_ran:
-                    try:
-                        already_ran = ha.device_ran_today_ha(load_cfg["power_entity"], threshold_w)
-                    except Exception as exc:
-                        log.debug("HA history fallback for already-ran check failed: %s", exc)
+                try:
+                    already_ran = ha.device_ran_today_ha(load_cfg["power_entity"], threshold_w)
+                except Exception as exc:
+                    log.debug("already-ran check failed for '%s': %s", name, exc)
             if already_ran:
                 log.info("Deferrable load '%s' already ran today — skipping", name)
                 continue
 
-            # Merge learned pattern params (overridden only when config doesn't specify)
-            pattern = _load_patterns.get(name, {})
-            effective_load = dict(load_cfg)
-            if "power_w" not in effective_load and "power_w" in pattern:
-                effective_load["power_w"] = pattern["power_w"]
-            if "duration_min" not in effective_load and "duration_min" in pattern:
-                effective_load["duration_min"] = pattern["duration_min"]
-
-            best_slot = _find_best_deferrable_start(pv_forecast, base_load, result, effective_load)
+            best_slot = _find_best_deferrable_start(pv_forecast, base_load, result, load_cfg)
             if best_slot is not None:
                 h, m = divmod(best_slot * 30, 60)
                 start_str = f"{h:02d}:{m:02d}"
                 load_starts.append((name, start_str))
                 mqtt.publish_deferrable_load(name, start_str)
-                log.info(
-                    "Deferrable load '%s': best start %s (source: %s)",
-                    name, start_str, pattern.get("source", "config"),
-                )
+                log.info("Deferrable load '%s': best start %s", name, start_str)
 
-        # Morning plan summary (rich text for push notification)
         mqtt.publish_morning_plan(result, pv_forecast, base_load, load_starts, is_workday,
                                   force_soc_pct=force_soc_pct, vacation_mode=vacation_mode)
 
@@ -370,43 +355,28 @@ def replan(
             executor.failsafe()
 
 
-def _try_train(cfg: Config, influx: InfluxClient, forecaster: LoadForecaster) -> int:
-    """Attempt ML training; return phase (2 if trained, 1 otherwise)."""
+def _try_train(cfg: Config, forecaster: LoadForecaster) -> int:
+    """Attempt ML training from HA long-term statistics; return phase (2 if trained, 1 otherwise)."""
     if not cfg.ml_enabled:
         return 1
     if forecaster.is_ready():
         return 2
-
-    availability = influx.check_data_availability()
-    log.info("InfluxDB data availability: %s", json.dumps(availability))
-    influx_days = min(availability.values(), default=0)
-
-    if influx_days >= 30:
-        log.info("Enough InfluxDB data (%d days) -- training LightGBM", influx_days)
-        if forecaster.train(influx):
+    log.info("Attempting LightGBM training from HA long-term statistics (up to 365 days)")
+    try:
+        ha_df = build_training_features_ha_stats(days_back=365)
+        if not ha_df.empty and forecaster.train_from_df(ha_df):
             return 2
-    else:
-        log.info(
-            "InfluxDB only has %d days -- trying HA long-term statistics (up to 365 days)",
-            influx_days,
-        )
-        try:
-            ha_df = build_training_features_ha_stats(days_back=365)
-            if not ha_df.empty and forecaster.train_from_df(ha_df):
-                return 2
-        except Exception as exc:
-            log.warning("HA statistics training failed: %s", exc)
-
+    except Exception as exc:
+        log.warning("HA statistics training failed: %s", exc)
     return 1
 
 
 def main() -> None:
-    global _learned_params, _load_patterns
+    global _learned_params
     cfg = Config.load()
     version = _read_addon_version()
     log.info("Starting Solar Optimizer v%s shadow_mode=%s", version, cfg.shadow_mode)
 
-    # Load auto-calibrated thermal params from previous run
     stored = load_params()
     if stored:
         _learned_params = stored
@@ -415,8 +385,6 @@ def main() -> None:
 
     ha = HAClient(cfg)
     ha.init_timezone()
-
-    influx = InfluxClient(cfg)
     forecaster = LoadForecaster()
     mqtt = MQTTPublisher(cfg)
     executor = Executor(cfg, ha, shadow=cfg.shadow_mode)
@@ -431,43 +399,22 @@ def main() -> None:
     server_thread.start()
     log.info("HTTP server starting on port 8099")
 
-    phase = _try_train(cfg, influx, forecaster)
+    phase = _try_train(cfg, forecaster)
     set_state("phase", phase)
     set_state("version", version)
     set_state("cfg", cfg)
     set_state("ha", ha)
 
-    # Learn deferrable device patterns from InfluxDB / HA long-term stats
-    _load_patterns = _refresh_load_patterns(influx, cfg)
-
     def _replan():
-        replan(cfg, ha, influx, executor, mqtt, forecaster, phase)
+        replan(cfg, ha, executor, mqtt, forecaster, phase)
 
     def _retrain():
         nonlocal phase
-        new_phase = _try_train(cfg, influx, forecaster)
+        new_phase = _try_train(cfg, forecaster)
         if new_phase != phase:
             log.info("Phase changed %d -> %d after retrain", phase, new_phase)
             phase = new_phase
         set_state("phase", phase)
-
-    def _calibrate_thermal():
-        global _learned_params
-        log.info("Running weekly DHW thermal calibration…")
-        try:
-            params = calibrate_dhw_params(influx, cfg)
-            if params.get("calibrated"):
-                save_params(params)
-                _learned_params = params
-            else:
-                log.info("Thermal calibration skipped: insufficient data")
-        except Exception as exc:
-            log.warning("Thermal calibration error: %s", exc)
-
-    def _refresh_patterns():
-        global _load_patterns
-        log.info("Running weekly deferrable load pattern refresh…")
-        _load_patterns = _refresh_load_patterns(influx, cfg)
 
     set_state("replan_fn", _replan)
 
@@ -476,8 +423,6 @@ def main() -> None:
     scheduler = BackgroundScheduler()
     scheduler.add_job(_replan, "interval", minutes=cfg.replan_interval_minutes, id="replan", max_instances=1)
     scheduler.add_job(_retrain, "cron", day_of_week="sun", hour=3, id="retrain")
-    scheduler.add_job(_calibrate_thermal, "cron", day_of_week="sun", hour=4, id="thermal_calibrate")
-    scheduler.add_job(_refresh_patterns, "cron", day_of_week="sun", hour=4, minute=30, id="pattern_refresh")
     scheduler.start()
     log.info("Scheduler started, replan every %d min", cfg.replan_interval_minutes)
 
