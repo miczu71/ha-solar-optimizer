@@ -62,6 +62,18 @@ SENSOR_CONFIGS = {
         "icon": "mdi:solar-power",
         "value_template": "{{ value_json.state }}",
     },
+    "savings_pln": {
+        "name": "Optimizer Savings Today PLN",
+        "unit_of_measurement": "PLN",
+        "icon": "mdi:cash-plus",
+        "state_class": "measurement",
+        "value_template": "{{ value_json.state }}",
+    },
+    "morning_plan": {
+        "name": "Optimizer Morning Plan",
+        "icon": "mdi:weather-sunny-alert",
+        "value_template": "{{ value_json.state }}",
+    },
     # Per-slot planned values — update every 30 min, enable plan-vs-reality charts
     "planned_pv_w": {
         "name": "Optimizer Planned PV Power",
@@ -252,6 +264,90 @@ class MQTTPublisher:
         self._client.publish(
             self._state_topic("sensor", "grid_import_avoided_kwh"),
             json.dumps({"state": round(kwh, 3)}),
+            retain=True,
+        )
+
+    def publish_savings(self, savings_pln: float, cost_pln: float) -> None:
+        self._client.publish(
+            self._state_topic("sensor", "savings_pln"),
+            json.dumps({"state": round(savings_pln, 2), "cost_pln": round(cost_pln, 2)}),
+            retain=True,
+        )
+
+    def publish_morning_plan(
+        self,
+        result: "OptimizeResult",
+        pv_forecast: list,
+        base_load: list,
+        load_starts: list,
+        is_workday: bool,
+        force_soc_pct: float = 0.0,
+        vacation_mode: bool = False,
+    ) -> None:
+        """Publish a human-readable daily plan summary for push notifications."""
+        from optimizer import PEAK_PRICE, OFFPEAK_PRICE
+        pv_total = round(sum(pv_forecast), 1)
+        import_total = round(sum(result.grid_import_kwh), 2)
+        soc_start = round(result.soc_trajectory[0], 0) if result.soc_trajectory else 0
+        soc_end = round(result.soc_trajectory[-1], 0) if result.soc_trajectory else 0
+        savings = round(result.savings_pln, 2)
+        cost = round(result.optimized_cost_pln, 2)
+
+        # Find DHW heating windows
+        dhw_windows = []
+        in_window, wstart = False, 0
+        for t, kwh in enumerate(result.dhw_heat_energy):
+            if kwh > 0.02 and not in_window:
+                in_window, wstart = True, t
+            elif kwh <= 0.02 and in_window:
+                h1, m1 = divmod(wstart * 30, 60)
+                h2, m2 = divmod(t * 30, 60)
+                dhw_windows.append(f"{h1:02d}:{m1:02d}–{h2:02d}:{m2:02d}")
+                in_window = False
+        if in_window:
+            h1, m1 = divmod(wstart * 30, 60)
+            dhw_windows.append(f"{h1:02d}:{m1:02d}–23:30")
+
+        day_type = "Dzień roboczy" if is_workday else "Weekend/święto"
+        lines = [
+            f"☀️ PV: {pv_total} kWh  🔋 Bat: {soc_start:.0f}→{soc_end:.0f}%  📥 Import: {import_total} kWh (~{cost} PLN)  💰 Oszczędność: ~{savings} PLN  [{day_type}]",
+        ]
+        if dhw_windows:
+            lines.append("🚿 CWU: " + ", ".join(dhw_windows))
+        for name, start in load_starts:
+            lines.append(f"🔌 {name}: najlepiej o {start}")
+        if force_soc_pct > 0:
+            lines.append(f"⚡ Force charge: cel {force_soc_pct:.0f}%")
+        if vacation_mode:
+            lines.append("🏖️ Tryb wakacyjny aktywny")
+
+        summary = "\n".join(lines)
+        self._client.publish(
+            self._state_topic("sensor", "morning_plan"),
+            json.dumps({"state": summary[:255]}),
+            retain=True,
+        )
+
+    def publish_deferrable_load(self, name: str, start_time: str) -> None:
+        """Publish recommended start time for a deferrable load."""
+        slug = name.lower().replace(" ", "_").replace("-", "_")
+        sensor_name = f"load_{slug}_start"
+        # Register sensor via discovery on first publish
+        topic_config = f"{DISCOVERY_PREFIX}/sensor/{NODE_ID}_{sensor_name}/config"
+        device = {"identifiers": [NODE_ID], "name": "Solar Optimizer",
+                  "model": "ha-solar-optimizer", "manufacturer": "Custom"}
+        config = {
+            "unique_id": f"{NODE_ID}_{sensor_name}",
+            "name": f"Optimizer {name} start time",
+            "icon": "mdi:clock-start",
+            "state_topic": self._state_topic("sensor", sensor_name),
+            "value_template": "{{ value_json.state }}",
+            "device": device,
+        }
+        self._client.publish(topic_config, json.dumps(config), retain=True)
+        self._client.publish(
+            self._state_topic("sensor", sensor_name),
+            json.dumps({"state": start_time, "load": name}),
             retain=True,
         )
 

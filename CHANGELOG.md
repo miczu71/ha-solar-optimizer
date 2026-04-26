@@ -5,6 +5,25 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [0.3.8] — 2026-04-26
+
+### Added
+- **G12W Polish public holiday awareness**: `g12w_peak_vector` now accepts an `is_workday` flag read from HA's workday binary sensor (`binary_sensor.workday_sensor` by default). All Polish public holidays (fixed + Easter-based) are automatically excluded from peak tariff windows — no manual calendar maintenance required.
+- **PLN cost savings sensor** (`sensor.optimizer_savings_pln`): published after every replan. Compares optimised grid cost vs. naive baseline (no battery / no DHW dispatch) using per-slot G12W prices. Visible on Lovelace and in the morning notification.
+- **Daily morning plan notification**: `sensor.optimizer_morning_plan` publishes a rich text summary after each replan (PV forecast, battery trajectory, import, PLN savings, day type, DHW windows, deferrable load recommendations). HA automation in the package sends it to `notify.family` at 06:35.
+- **Deferrable load scheduling** (advisory): configure appliances (e.g. dishwasher, washing machine) in `deferrable_loads` option. After each replan a sliding-window algorithm finds the slot that maximises PV coverage and publishes `sensor.optimizer_load_{name}_start_time`. No changes to LP solver — purely advisory.
+- **Manual force-charge override**: set `input_number.optimizer_force_soc_target` (0 = disabled, 5–100%) and `input_number.optimizer_force_soc_deadline_hour`. Adds a hard LP constraint `soc[deadline] ≥ target`. Auto-cleared by setting back to 0. Notification sent on activation.
+- **Vacation mode**: `input_boolean.optimizer_vacation_mode` + `input_number.optimizer_vacation_dhw_setpoint` (default 55°C). Passes an elevated `dhw_comfort_min` to the LP, keeping tank hotter while away.
+- **Comfort profiles** (weekday vs. weekend/holiday DHW): `dhw_demand_hour_weekday` (default 07:00) and `dhw_demand_hour_weekend` (default 09:00) shift the DHW comfort-floor enforcement window automatically on non-workdays.
+- **Auto-tune thermal parameters** (`thermal_calibrator.py`): runs weekly (Sunday 04:00). Queries 30 days of InfluxDB data, fits `dhw_loss_rate_c_per_hour` from idle-period temperature decay and `dhw_cop` from heating-period electrical/thermal ratios. Results saved to `/data/learned_params.json` and used in subsequent replans. Falls back to config defaults when insufficient data.
+
+### Changed
+- `run_optimizer()` now accepts `is_workday`, `force_soc_pct`, `force_soc_deadline_hour`, `vacation_dhw_setpoint`, `learned_dhw_loss_rate`, `learned_dhw_cop` — all optional with safe defaults.
+- `OptimizeResult` gains `savings_pln`, `optimized_cost_pln`, `naive_cost_pln`.
+- DHW demand window is now always set from the comfort profile (not only when bath-request is active).
+
+---
+
 ## [0.3.7] — 2026-04-26
 
 ### Added

@@ -28,11 +28,14 @@ OFFPEAK_PRICE = 0.63
 AC_UNITS = ["salon", "pietro", "poddasze"]
 
 
-def g12w_peak_vector(reference: datetime) -> list[bool]:
-    """Returns 48-element list: True=peak for each 30-min slot starting at midnight of `reference`."""
+def g12w_peak_vector(reference: datetime, is_workday: bool) -> list[bool]:
+    """Returns 48-element list: True=peak for each 30-min slot starting at midnight of `reference`.
+
+    Peak windows (Mon–Fri AND not a Polish public holiday per HA workday sensor):
+      06:00–13:00  and  15:00–22:00
+    Weekends and holidays are off-peak all day.
+    """
     peak = []
-    wd = reference.weekday()  # Mon=0, Sun=6
-    is_workday = wd < 5
     for slot in range(SLOTS):
         hour = slot // 2
         if is_workday and (6 <= hour < 13 or 15 <= hour < 22):
@@ -62,6 +65,10 @@ class OptimizeResult:
     # Per-slot LP solution arrays for charge-source breakdown
     pv_to_battery_kwh: list[float] = field(default_factory=list)
     bat_to_load_kwh: list[float] = field(default_factory=list)
+    # Cost / savings vs naive (no battery / no DHW) baseline in PLN
+    savings_pln: float = 0.0
+    optimized_cost_pln: float = 0.0
+    naive_cost_pln: float = 0.0
 
 
 def run_optimizer(
@@ -78,16 +85,23 @@ def run_optimizer(
     enable_battery: bool = True,
     enable_dhw: bool = True,
     enable_ac: bool = True,
+    is_workday: bool = True,
+    force_soc_pct: float = 0.0,
+    force_soc_deadline_hour: int = 8,
+    vacation_dhw_setpoint: Optional[float] = None,
+    learned_dhw_loss_rate: Optional[float] = None,
+    learned_dhw_cop: Optional[float] = None,
 ) -> OptimizeResult:
     if now is None:
         now = datetime.now(timezone.utc)
 
-    is_peak = g12w_peak_vector(now)
+    is_peak = g12w_peak_vector(now, is_workday)
+    dhw_comfort_min_eff = vacation_dhw_setpoint if vacation_dhw_setpoint is not None else cfg.dhw_comfort_min
     dhw_model = DHWModel(
         tank_liters=cfg.dhw_tank_liters,
-        loss_rate_c_per_hour=cfg.dhw_loss_rate_c_per_hour,
-        cop=cfg.dhw_cop,
-        comfort_min=cfg.dhw_comfort_min,
+        loss_rate_c_per_hour=learned_dhw_loss_rate if learned_dhw_loss_rate is not None else cfg.dhw_loss_rate_c_per_hour,
+        cop=learned_dhw_cop if learned_dhw_cop is not None else cfg.dhw_cop,
+        comfort_min=dhw_comfort_min_eff,
         max_temp=cfg.dhw_max_temp,
     )
 
@@ -213,7 +227,7 @@ def run_optimizer(
 
         # DHW comfort floor at demand slots
         if enable_dhw and dhw_demand_slots[t]:
-            prob += dhw_temp[t] >= cfg.dhw_comfort_min
+            prob += dhw_temp[t] >= dhw_comfort_min_eff
 
         # DHW max heat per slot
         max_heat = dhw_model.thermal_mass_kwh_per_c * (cfg.dhw_max_temp - cfg.dhw_comfort_min)
@@ -223,6 +237,14 @@ def run_optimizer(
         if t > 0:
             prob += dhw_thrash[t - 1] >= dhw[t] - dhw[t - 1]
             prob += dhw_thrash[t - 1] >= dhw[t - 1] - dhw[t]
+
+    # Force-SoC override: hard constraint to reach target SoC by a given hour
+    if force_soc_pct > 0:
+        deadline_slot = min(SLOTS, force_soc_deadline_hour * 2)
+        target_kwh = min(soc_max_kwh, force_soc_pct / 100 * bat_cap_kwh)
+        prob += soc[deadline_slot] >= target_kwh
+        log.info("Force-SoC override active: target %.0f%% (%.2f kWh) by slot %d (%02d:00)",
+                 force_soc_pct, target_kwh, deadline_slot, force_soc_deadline_hour)
 
     solver = pulp.PULP_CBC_CMD(msg=0, timeLimit=30)
     prob.solve(solver)
@@ -243,6 +265,12 @@ def run_optimizer(
         val = pulp.value(var)
         return float(val) if val is not None else 0.0
 
+    # PLN cost savings vs naive baseline (no battery dispatch, no DHW optimisation)
+    price_vec = [PEAK_PRICE if p else OFFPEAK_PRICE for p in is_peak]
+    naive_cost = sum(max(0.0, base_load_kwh[t] - pv_forecast_kwh[t]) * price_vec[t] for t in range(SLOTS))
+    opt_cost = sum(v(grid_import[t]) * price_vec[t] for t in range(SLOTS))
+    savings = round(naive_cost - opt_cost, 2)
+
     return OptimizeResult(
         status=status,
         dhw_heat_energy=[v(dhw[t]) for t in range(SLOTS)],
@@ -260,4 +288,7 @@ def run_optimizer(
         is_peak=list(is_peak),
         pv_to_battery_kwh=[v(pv_to_bat[t]) for t in range(SLOTS)],
         bat_to_load_kwh=[v(bat_to_load[t]) for t in range(SLOTS)],
+        savings_pln=savings,
+        optimized_cost_pln=round(opt_cost, 2),
+        naive_cost_pln=round(naive_cost, 2),
     )
