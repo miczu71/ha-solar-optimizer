@@ -1,6 +1,6 @@
 name: "Solar Optimizer"
 description: "EMHASS-like ML energy optimizer for Huawei solar+battery, heat pump DHW, and Midea AC dispatch"
-version: "0.3.8"
+version: "0.3.9"
 slug: "solar_optimizer"
 init: false
 arch:
@@ -45,7 +45,8 @@ options:
   legionella_hours: 24
   ml_enabled: true
   shadow_mode: true
-  workday_entity: "binary_sensor.workday_sensor"
+  workday_entity: "binary_sensor.workday"
+  workday_tomorrow_entity: "binary_sensor.workday_tomorrow"
   dhw_demand_hour_weekday: 7
   dhw_demand_hour_weekend: 9
   force_soc_entity: "input_number.optimizer_force_soc_target"
@@ -84,6 +85,7 @@ schema:
   ml_enabled: bool
   shadow_mode: bool
   workday_entity: str
+  workday_tomorrow_entity: str
   dhw_demand_hour_weekday: int(0,12)
   dhw_demand_hour_weekend: int(0,12)
   force_soc_entity: str

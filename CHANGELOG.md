@@ -5,6 +5,25 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [0.3.9] — 2026-04-26
+
+### Added
+- **Deferrable load InfluxDB pattern learning**: `InfluxClient.learn_device_patterns()` analyses historical run data for each configured deferrable load and produces learned `power_w`, `duration_min`, `typical_start_slot`, and `daily_run_prob`. Falls back to HA long-term statistics (SQLite `statistics` table via `ha_statistics_client`) when InfluxDB has no data, then to config-file defaults.
+- **Already-ran-today detection**: before scheduling a deferrable load, the optimizer checks InfluxDB (`device_ran_today()`) and — if InfluxDB is unavailable — falls back to HA's history API (`ha_client.device_ran_today_ha()`). Devices that already ran are skipped; the MQTT sensor retains the previous recommendation.
+- **Deferrable load subtraction from base-load signal**: `rolling_mean_base_load()` now accepts `deferrable_power_entities`; their historical W traces are subtracted from house consumption before computing the 7-day per-slot mean. This prevents washing-machine / dishwasher cycles from inflating the ML base-load estimate and being double-scheduled.
+- **`workday_tomorrow_entity`** config field (default `binary_sensor.workday_tomorrow`) for future 48-hour planning horizon extension.
+- **Weekly pattern refresh job** (`_refresh_patterns`, Sunday 04:30): keeps learned power/duration stats current without requiring a restart.
+
+### Fixed
+- **Workday entity default corrected**: was `binary_sensor.workday_sensor`, now `binary_sensor.workday` (matching the actual HA integration entity names).
+
+### Changed
+- `InfluxClient.rolling_mean_base_load()` gains optional `deferrable_power_entities: list[str] | None` parameter (backward-compatible, defaults to `None`).
+- `build_base_load_forecast()` passes deferrable entity list to `rolling_mean_base_load()` automatically.
+- `replan()` deferrable-load block now: (1) checks already-ran, (2) merges learned power/duration into the sliding-window params, (3) logs the pattern source (`learned` vs `config_defaults`).
+
+---
+
 ## [0.3.8] — 2026-04-26
 
 ### Added

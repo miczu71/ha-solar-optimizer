@@ -34,6 +34,7 @@ _consecutive_failures = 0
 _HISTORY_FILE = "/data/plan_history.jsonl"
 _HISTORY_MAX_RECORDS = 1440  # ~30 days at 48 replans/day
 _learned_params: dict = {}   # populated from /data/learned_params.json at startup / after calibration
+_load_patterns: dict = {}    # {load_name: {power_w, duration_min, typical_start_slot, ...}}
 
 
 def _read_addon_version() -> str:
@@ -74,6 +75,19 @@ def build_pv_forecast(ha: HAClient) -> list[float]:
     return [by_slot.get(s, 0.0) for s in range(48)]
 
 
+def _refresh_load_patterns(influx: InfluxClient, cfg: Config) -> dict:
+    """Learn device run patterns from InfluxDB (HA stats fallback built into influx_client)."""
+    if not cfg.deferrable_loads:
+        return {}
+    try:
+        patterns = influx.learn_device_patterns(cfg.deferrable_loads)
+        log.info("Refreshed load patterns for %d devices", len(patterns))
+        return patterns
+    except Exception as exc:
+        log.warning("Device pattern learning failed: %s", exc)
+        return {}
+
+
 def build_base_load_forecast(
     influx: InfluxClient,
     forecaster: LoadForecaster,
@@ -82,6 +96,8 @@ def build_base_load_forecast(
     now_local: datetime,
     phase: int,
 ) -> list[float]:
+    deferred_entities = [lc["power_entity"] for lc in cfg.deferrable_loads if "power_entity" in lc]
+
     if phase == 2 and forecaster.is_ready():
         try:
             outdoor = ha.outdoor_temp
@@ -89,11 +105,11 @@ def build_base_load_forecast(
             lag_7d = {}
             pv_yesterday = 5.0
             try:
-                lag_1d = influx.rolling_mean_base_load(days_back=1)
+                lag_1d = influx.rolling_mean_base_load(days_back=1, deferrable_power_entities=deferred_entities)
             except Exception as exc:
                 log.debug("lag_1d InfluxDB fetch failed: %s", exc)
             try:
-                lag_7d = influx.rolling_mean_base_load(days_back=7)
+                lag_7d = influx.rolling_mean_base_load(days_back=7, deferrable_power_entities=deferred_entities)
             except Exception as exc:
                 log.debug("lag_7d InfluxDB fetch failed: %s", exc)
             try:
@@ -116,7 +132,7 @@ def build_base_load_forecast(
             log.warning("LightGBM forecast failed, falling back to rolling mean: %s", exc)
 
     try:
-        rolling = influx.rolling_mean_base_load(days_back=7)
+        rolling = influx.rolling_mean_base_load(days_back=7, deferrable_power_entities=deferred_entities)
         return [float(rolling.get(s, 0.3)) for s in range(48)]
     except Exception as exc:
         log.warning("Rolling mean failed, using flat 0.3 kWh/slot: %s", exc)
@@ -306,13 +322,39 @@ def replan(
         load_starts: list[tuple[str, str]] = []
         for load_cfg in cfg.deferrable_loads:
             name = load_cfg.get("name", "load")
-            best_slot = _find_best_deferrable_start(pv_forecast, base_load, result, load_cfg)
+            threshold_w = float(load_cfg.get("run_threshold_w", 50))
+
+            # Skip if device already ran today — check InfluxDB, fall back to HA history API
+            already_ran = False
+            if "power_entity" in load_cfg:
+                already_ran = influx.device_ran_today(load_cfg["power_entity"], threshold_w)
+                if not already_ran:
+                    try:
+                        already_ran = ha.device_ran_today_ha(load_cfg["power_entity"], threshold_w)
+                    except Exception as exc:
+                        log.debug("HA history fallback for already-ran check failed: %s", exc)
+            if already_ran:
+                log.info("Deferrable load '%s' already ran today — skipping", name)
+                continue
+
+            # Merge learned pattern params (overridden only when config doesn't specify)
+            pattern = _load_patterns.get(name, {})
+            effective_load = dict(load_cfg)
+            if "power_w" not in effective_load and "power_w" in pattern:
+                effective_load["power_w"] = pattern["power_w"]
+            if "duration_min" not in effective_load and "duration_min" in pattern:
+                effective_load["duration_min"] = pattern["duration_min"]
+
+            best_slot = _find_best_deferrable_start(pv_forecast, base_load, result, effective_load)
             if best_slot is not None:
                 h, m = divmod(best_slot * 30, 60)
                 start_str = f"{h:02d}:{m:02d}"
                 load_starts.append((name, start_str))
                 mqtt.publish_deferrable_load(name, start_str)
-                log.info("Deferrable load '%s': best start %s", name, start_str)
+                log.info(
+                    "Deferrable load '%s': best start %s (source: %s)",
+                    name, start_str, pattern.get("source", "config"),
+                )
 
         # Morning plan summary (rich text for push notification)
         mqtt.publish_morning_plan(result, pv_forecast, base_load, load_starts, is_workday,
@@ -359,7 +401,7 @@ def _try_train(cfg: Config, influx: InfluxClient, forecaster: LoadForecaster) ->
 
 
 def main() -> None:
-    global _learned_params
+    global _learned_params, _load_patterns
     cfg = Config.load()
     version = _read_addon_version()
     log.info("Starting Solar Optimizer v%s shadow_mode=%s", version, cfg.shadow_mode)
@@ -395,6 +437,9 @@ def main() -> None:
     set_state("cfg", cfg)
     set_state("ha", ha)
 
+    # Learn deferrable device patterns from InfluxDB / HA long-term stats
+    _load_patterns = _refresh_load_patterns(influx, cfg)
+
     def _replan():
         replan(cfg, ha, influx, executor, mqtt, forecaster, phase)
 
@@ -419,6 +464,11 @@ def main() -> None:
         except Exception as exc:
             log.warning("Thermal calibration error: %s", exc)
 
+    def _refresh_patterns():
+        global _load_patterns
+        log.info("Running weekly deferrable load pattern refresh…")
+        _load_patterns = _refresh_load_patterns(influx, cfg)
+
     set_state("replan_fn", _replan)
 
     _replan()
@@ -427,6 +477,7 @@ def main() -> None:
     scheduler.add_job(_replan, "interval", minutes=cfg.replan_interval_minutes, id="replan", max_instances=1)
     scheduler.add_job(_retrain, "cron", day_of_week="sun", hour=3, id="retrain")
     scheduler.add_job(_calibrate_thermal, "cron", day_of_week="sun", hour=4, id="thermal_calibrate")
+    scheduler.add_job(_refresh_patterns, "cron", day_of_week="sun", hour=4, minute=30, id="pattern_refresh")
     scheduler.start()
     log.info("Scheduler started, replan every %d min", cfg.replan_interval_minutes)
 

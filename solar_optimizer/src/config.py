@@ -40,7 +40,8 @@ class Config:
     ml_enabled: bool = True
     shadow_mode: bool = True
     # Polish public holiday awareness — reads HA workday binary_sensor
-    workday_entity: str = "binary_sensor.workday_sensor"
+    workday_entity: str = "binary_sensor.workday"
+    workday_tomorrow_entity: str = "binary_sensor.workday_tomorrow"
     # Comfort profiles: DHW demand window shifts on weekends/holidays
     dhw_demand_hour_weekday: int = 7   # comfort floor enforced from this hour on workdays
     dhw_demand_hour_weekend: int = 9   # comfort floor enforced from this hour on weekends/holidays

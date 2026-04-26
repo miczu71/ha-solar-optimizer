@@ -117,7 +117,7 @@ class HAClient:
     def outdoor_temp(self) -> float:
         return self.get_state_value("sensor.temperature_weather_station", default=15.0)
 
-    def is_workday(self, entity_id: str = "binary_sensor.workday_sensor") -> bool:
+    def is_workday(self, entity_id: str = "binary_sensor.workday") -> bool:
         """Return True if HA workday sensor reports today as a working day.
 
         Handles all Polish public holidays automatically — the HA workday integration
@@ -237,6 +237,12 @@ class HAClient:
             "climate", "set_temperature",
             {"entity_id": entity_id, "temperature": temperature},
         )
+
+    def device_ran_today_ha(self, entity_id: str, run_threshold_w: float = 50.0) -> bool:
+        """Return True if HA history shows power > threshold at any 30-min slot today."""
+        history = self.get_history_today_30min([entity_id])
+        slots = history.get(entity_id, [])
+        return any(v is not None and v > run_threshold_w for v in slots)
 
     def get_ac_state(self, entity_id: str) -> dict[str, Any]:
         return self.get_state(entity_id)
