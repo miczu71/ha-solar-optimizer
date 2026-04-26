@@ -5,6 +5,13 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [0.3.10] — 2026-04-26
+
+### Fixed
+- **Add-on invisible in HA store** (critical): `deferrable_loads: list` in `config.yaml` schema is not a valid type in HA Supervisor's schema validator. The Supervisor silently rejects the entire `config.yaml` during repository scanning, causing the add-on to never appear in the store. Fixed by replacing bare `list` with a properly typed list-of-objects schema (all sub-fields optional).
+
+---
+
 ## [0.3.9] — 2026-04-26
 
 ### Added

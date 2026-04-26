@@ -1,6 +1,6 @@
 name: "Solar Optimizer"
 description: "EMHASS-like ML energy optimizer for Huawei solar+battery, heat pump DHW, and Midea AC dispatch"
-version: "0.3.9"
+version: "0.3.10"
 slug: "solar_optimizer"
 init: false
 arch:
@@ -92,4 +92,12 @@ schema:
   force_soc_deadline_entity: str
   vacation_mode_entity: str
   vacation_dhw_setpoint_entity: str
-  deferrable_loads: list
+  deferrable_loads:
+    - name: str
+      power_w: int?
+      duration_min: int?
+      earliest_slot: int?
+      latest_slot: int?
+      power_entity: str?
+      energy_entity: str?
+      run_threshold_w: float?
