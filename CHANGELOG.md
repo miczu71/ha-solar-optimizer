@@ -5,6 +5,13 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [0.3.14] — 2026-04-27
+
+### Fixed
+- **MQTT entity IDs still wrong after unique_id change**: HA uses the discovery config *topic* (not just unique_id) as the registration key. Publishing new unique_ids to the same `homeassistant/sensor/solar_optimizer_*/config` topics meant HA treated them as updates to existing entities and kept the old entity_ids. Fixed by changing `NODE_ID` from `solar_optimizer` to `solar_opt` — this changes the config topic path to `homeassistant/sensor/solar_opt_*/config`, which HA has never seen before, forcing fresh entity creation with correct `object_id`-derived IDs.
+
+---
+
 ## [0.3.13] — 2026-04-27
 
 ### Fixed

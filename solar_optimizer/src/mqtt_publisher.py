@@ -14,7 +14,8 @@ from optimizer import OptimizeResult
 log = logging.getLogger(__name__)
 
 DISCOVERY_PREFIX = "homeassistant"
-NODE_ID = "solar_optimizer"
+NODE_ID = "solar_opt"        # short prefix keeps entity IDs clean: sensor.optimizer_*
+DEVICE_ID = "solar_optimizer"  # stable device identifier (not used in entity_id generation)
 
 
 SENSOR_CONFIGS = {
@@ -174,7 +175,7 @@ class MQTTPublisher:
 
     def _publish_discovery(self) -> None:
         device = {
-            "identifiers": [NODE_ID],
+            "identifiers": [DEVICE_ID],
             "name": "Solar Optimizer",
             "model": "ha-solar-optimizer",
             "manufacturer": "Custom",
@@ -336,7 +337,7 @@ class MQTTPublisher:
         sensor_name = f"load_{slug}_start"
         # Register sensor via discovery on first publish
         topic_config = f"{DISCOVERY_PREFIX}/sensor/{NODE_ID}_{sensor_name}/config"
-        device = {"identifiers": [NODE_ID], "name": "Solar Optimizer",
+        device = {"identifiers": [DEVICE_ID], "name": "Solar Optimizer",
                   "model": "ha-solar-optimizer", "manufacturer": "Custom"}
         config = {
             "unique_id": f"solar_opt_{sensor_name}",
