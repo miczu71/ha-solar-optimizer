@@ -5,6 +5,14 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [0.3.16] — 2026-04-27
+
+### Fixed
+- **DHW actual line always blank**: `/actual-today` fetched `sensor.heiko_heat_pump_water_temperature` correctly but looked up the result with the old key `sensor.heiko_hot_water_dhw_temperature`, returning `[None]*48` every time.
+- **SoC / DHW actual gaps**: resampler produces `None` for slots where the sensor had no `last_changed` event (e.g. SoC constant for several minutes). Added forward-fill (`_ffill`) for `soc_pct` and `dhw_temp_c` so gaps are bridged from the last known value instead of showing blank.
+
+---
+
 ## [0.3.15] — 2026-04-27
 
 ### Fixed

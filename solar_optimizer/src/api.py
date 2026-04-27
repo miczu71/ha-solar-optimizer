@@ -800,6 +800,16 @@ def actual_today() -> JSONResponse:
     ]
     hist = ha.get_history_today_30min(entity_ids)
 
+    def _ffill(values: list) -> list:
+        """Forward-fill None slots from the last known value."""
+        out, last = list(values), None
+        for i, v in enumerate(out):
+            if v is not None:
+                last = v
+            elif last is not None:
+                out[i] = last
+        return out
+
     # Sign-correct grid: power_meter_active_power positive=export, negative=import
     raw_grid = hist.get("sensor.power_meter_active_power", [None] * 48)
     grid_import_w = [round(max(0.0, -v), 1) if v is not None else None for v in raw_grid]
@@ -810,9 +820,9 @@ def actual_today() -> JSONResponse:
         "current_slot": now_slot,
         "pv_w": hist.get("sensor.inverter_input_power", [None] * 48),
         "load_w": hist.get("sensor.house_consumption_power", [None] * 48),
-        "soc_pct": hist.get("sensor.battery_state_of_capacity", [None] * 48),
+        "soc_pct": _ffill(hist.get("sensor.battery_state_of_capacity", [None] * 48)),
         "grid_import_w": grid_import_w,
-        "dhw_temp_c": hist.get("sensor.heiko_hot_water_dhw_temperature", [None] * 48),
+        "dhw_temp_c": _ffill(hist.get("sensor.heiko_heat_pump_water_temperature", [None] * 48)),
     })
 
 
