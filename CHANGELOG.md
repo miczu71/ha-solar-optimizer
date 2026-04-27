@@ -5,6 +5,13 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [0.3.17] — 2026-04-27
+
+### Added
+- **"Now" marker on all plan charts**: a dashed white vertical line with a "now" label is drawn at the current 30-min slot on the Energy flows, Battery SoC & DHW, and Battery charge breakdown charts.
+
+---
+
 ## [0.3.16] — 2026-04-27
 
 ### Fixed

@@ -452,6 +452,18 @@ async function loadPlan(){
       title:{display:true,text:lbl,color:clr,font:{size:10}}
     });
     const w2k=v=>v!=null?Math.round(v/2)/1000:null;
+    const nowSlot=act?act.current_slot:null;
+    const nowPlugin={id:'nowLine',afterDraw(chart){
+      if(nowSlot==null)return;
+      const xs=chart.scales.x;if(!xs)return;
+      const x=xs.getPixelForValue(nowSlot),{top,bottom}=chart.chartArea,ctx=chart.ctx;
+      ctx.save();
+      ctx.beginPath();ctx.moveTo(x,top);ctx.lineTo(x,bottom);
+      ctx.lineWidth=1.5;ctx.strokeStyle='rgba(255,255,255,0.45)';ctx.setLineDash([4,4]);ctx.stroke();
+      ctx.setLineDash([]);ctx.fillStyle='rgba(255,255,255,0.6)';ctx.font='9px monospace';ctx.textAlign='center';
+      ctx.fillText('now',x,top-2);
+      ctx.restore();
+    }};
 
     if(eChart)eChart.destroy();
     const eDS=[
@@ -467,7 +479,8 @@ async function loadPlan(){
     }
     eChart=new Chart(document.getElementById('ce').getContext('2d'),{
       data:{labels:SL,datasets:eDS},
-      options:{...CO,scales:{...CO.scales,y:{ticks:{color:'#64748b',font:{size:10}},grid:{color:'#1a2640'},title:{display:true,text:'kWh',color:'#64748b',font:{size:10}}}}}
+      options:{...CO,scales:{...CO.scales,y:{ticks:{color:'#64748b',font:{size:10}},grid:{color:'#1a2640'},title:{display:true,text:'kWh',color:'#64748b',font:{size:10}}}}},
+      plugins:[nowPlugin]
     });
 
     if(tChart)tChart.destroy();
@@ -483,7 +496,8 @@ async function loadPlan(){
       type:'line',
       data:{labels:SL,datasets:tDS},
       options:{...CO,plugins:{...CO.plugins,legend:{display:true,labels:{color:'#e2e8f0',font:{family:'monospace',size:11},boxWidth:10}}},
-        scales:{...CO.scales,soc:yAx('soc','left','#60a5fa',0,105,'SoC %'),dhw:yAx('dhw','right','#fb923c',35,65,'DHW °C')}}
+        scales:{...CO.scales,soc:yAx('soc','left','#60a5fa',0,105,'SoC %'),dhw:yAx('dhw','right','#fb923c',35,65,'DHW °C')}},
+      plugins:[nowPlugin]
     });
 
     if(bChart)bChart.destroy();
@@ -495,7 +509,8 @@ async function loadPlan(){
         {label:'Bat→Load',data:s.map(x=>-(x.bat_to_load_kwh||0)),backgroundColor:'rgba(248,113,113,.55)',borderColor:'#f87171',borderWidth:.5,stack:'dch'},
       ]},
       options:{...CO,plugins:{...CO.plugins,legend:{display:true,labels:{color:'#e2e8f0',font:{family:'monospace',size:11},boxWidth:10}}},
-        scales:{...CO.scales,y:{ticks:{color:'#64748b',font:{size:10}},grid:{color:'#1a2640'},title:{display:true,text:'kWh',color:'#64748b',font:{size:10}}}}}
+        scales:{...CO.scales,y:{ticks:{color:'#64748b',font:{size:10}},grid:{color:'#1a2640'},title:{display:true,text:'kWh',color:'#64748b',font:{size:10}}}}},
+      plugins:[nowPlugin]
     });
 
     const now=new Date();
