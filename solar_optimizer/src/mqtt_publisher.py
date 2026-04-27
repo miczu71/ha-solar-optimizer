@@ -14,8 +14,8 @@ from optimizer import OptimizeResult
 log = logging.getLogger(__name__)
 
 DISCOVERY_PREFIX = "homeassistant"
-NODE_ID = "solar_opt"        # short prefix keeps entity IDs clean: sensor.optimizer_*
-DEVICE_ID = "solar_optimizer"  # stable device identifier (not used in entity_id generation)
+NODE_ID = "solar_optimizer"
+DEVICE_ID = "solar_optimizer"
 
 
 SENSOR_CONFIGS = {
@@ -182,8 +182,7 @@ class MQTTPublisher:
         }
         for name, extra in SENSOR_CONFIGS.items():
             config = {
-                "unique_id": f"solar_opt_{name}",
-                "object_id": f"optimizer_{name}",
+                "unique_id": f"{NODE_ID}_{name}",
                 "state_topic": self._state_topic("sensor", name),
                 "device": device,
                 **extra,
@@ -196,8 +195,7 @@ class MQTTPublisher:
 
         for name, friendly in SWITCH_CONFIGS.items():
             config = {
-                "unique_id": f"solar_opt_{name}",
-                "object_id": f"optimizer_{name}",
+                "unique_id": f"{NODE_ID}_{name}",
                 "name": friendly,
                 "state_topic": self._state_topic("switch", name),
                 "command_topic": f"{DISCOVERY_PREFIX}/switch/{NODE_ID}_{name}/set",
@@ -340,8 +338,7 @@ class MQTTPublisher:
         device = {"identifiers": [DEVICE_ID], "name": "Solar Optimizer",
                   "model": "ha-solar-optimizer", "manufacturer": "Custom"}
         config = {
-            "unique_id": f"solar_opt_{sensor_name}",
-            "object_id": f"optimizer_{sensor_name}",
+            "unique_id": f"{NODE_ID}_{sensor_name}",
             "name": f"Optimizer {name} start time",
             "icon": "mdi:clock-start",
             "state_topic": self._state_topic("sensor", sensor_name),

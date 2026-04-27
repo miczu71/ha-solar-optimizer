@@ -5,6 +5,13 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [0.3.15] — 2026-04-27
+
+### Fixed
+- **MQTT entity ID naming — definitive fix**: `object_id` in MQTT discovery is ignored by HA when a `device` block is present; HA always auto-generates the entity_id as `{device_slug}_{entity_slug}`. Reverted `NODE_ID` back to `solar_optimizer` so the canonical entity IDs are `sensor.solar_optimizer_optimizer_*` / `switch.solar_optimizer_optimizer_*` (the `_2` duplicates from v0.3.13–0.3.14 will become orphaned). Updated `packages/solar_optimizer.yaml` in the HA config repo to reference these actual entity IDs throughout.
+
+---
+
 ## [0.3.14] — 2026-04-27
 
 ### Fixed
