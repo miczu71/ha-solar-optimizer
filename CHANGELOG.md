@@ -5,6 +5,13 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [0.3.13] — 2026-04-27
+
+### Fixed
+- **MQTT entity ID rename not applied to existing entities**: HA's entity registry is sticky — adding `object_id` to discovery messages does not rename entities that are already registered. Fixed by changing the `unique_id` prefix from `solar_optimizer_` to `solar_opt_`, forcing HA to treat all entities as new and create them with the correct `object_id`-derived IDs (`sensor.optimizer_*`, `switch.optimizer_*`). Old `solar_optimizer_optimizer_*` entities become orphaned and can be deleted from Settings → Entities.
+
+---
+
 ## [0.3.12] — 2026-04-27
 
 ### Fixed

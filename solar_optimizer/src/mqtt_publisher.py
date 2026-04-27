@@ -181,7 +181,7 @@ class MQTTPublisher:
         }
         for name, extra in SENSOR_CONFIGS.items():
             config = {
-                "unique_id": f"{NODE_ID}_{name}",
+                "unique_id": f"solar_opt_{name}",
                 "object_id": f"optimizer_{name}",
                 "state_topic": self._state_topic("sensor", name),
                 "device": device,
@@ -195,7 +195,7 @@ class MQTTPublisher:
 
         for name, friendly in SWITCH_CONFIGS.items():
             config = {
-                "unique_id": f"{NODE_ID}_{name}",
+                "unique_id": f"solar_opt_{name}",
                 "object_id": f"optimizer_{name}",
                 "name": friendly,
                 "state_topic": self._state_topic("switch", name),
@@ -339,7 +339,7 @@ class MQTTPublisher:
         device = {"identifiers": [NODE_ID], "name": "Solar Optimizer",
                   "model": "ha-solar-optimizer", "manufacturer": "Custom"}
         config = {
-            "unique_id": f"{NODE_ID}_{sensor_name}",
+            "unique_id": f"solar_opt_{sensor_name}",
             "object_id": f"optimizer_{sensor_name}",
             "name": f"Optimizer {name} start time",
             "icon": "mdi:clock-start",
