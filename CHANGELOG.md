@@ -5,6 +5,13 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [0.3.12] — 2026-04-27
+
+### Fixed
+- **MQTT entity ID double-prefix**: all MQTT-discovered entities had HA-generated IDs like `switch.solar_optimizer_optimizer_dhw_control` instead of the expected `switch.optimizer_dhw_control`. Fixed by adding `object_id` to every discovery payload — HA uses `object_id` as the entity_id slug, bypassing the `{device_name}_{entity_name}` auto-generation. Affects all sensors, switches, and dynamically-created deferrable-load sensors.
+
+---
+
 ## [0.3.11] — 2026-04-26
 
 ### Fixed
