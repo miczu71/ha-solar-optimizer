@@ -169,8 +169,9 @@ def run_optimizer(
     w_import = 1.0
     w_cost = 0.3
     w_thrash = 0.05
-    w_wear = 0.02
-    w_eod_soc = 0.15
+    w_wear_discharge = 0.01   # small discharge-wear penalty only
+    w_pv_charge = 0.10        # reward PV→battery charging (fill fast for backup/grid-failure)
+    w_eod_soc = 0.20          # raised: prioritise full battery at end of day
 
     price = [PEAK_PRICE if p else OFFPEAK_PRICE for p in is_peak]
 
@@ -178,9 +179,8 @@ def run_optimizer(
         w_import * pulp.lpSum(grid_import)
         + w_cost * pulp.lpSum(price[t] * grid_import[t] for t in range(SLOTS))
         + w_thrash * pulp.lpSum(dhw_thrash)
-        + w_wear * pulp.lpSum(
-            pv_to_bat[t] + bat_to_load[t] for t in range(SLOTS)
-        )
+        + w_wear_discharge * pulp.lpSum(bat_to_load[t] for t in range(SLOTS))
+        - w_pv_charge * pulp.lpSum(pv_to_bat[t] for t in range(SLOTS))
         - w_eod_soc * soc[SLOTS]
     )
 

@@ -5,6 +5,13 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [0.3.18] — 2026-04-28
+
+### Changed
+- **Battery charging strategy — prioritise solar fill**: removed the wear penalty on `pv_to_bat` that was discouraging fast solar charging. Added an explicit reward (`w_pv_charge = 0.10`) for every kWh charged from PV so the LP eagerly fills the battery whenever there is surplus, only exporting when the battery is full. Discharge-wear penalty retained at a reduced 0.01. Raised end-of-day SoC reward (`w_eod_soc`) from 0.15 → 0.20 to keep the battery as full as possible for overnight use and grid-failure backup.
+
+---
+
 ## [0.3.17] — 2026-04-27
 
 ### Added
