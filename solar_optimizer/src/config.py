@@ -20,8 +20,10 @@ class Config:
     battery_capacity_kwh: float = 5.0
     battery_max_charge_power_w: int = 2500
     battery_max_discharge_power_w: int = 2500
-    soc_min_percent: int = 10
+    soc_reserve_pct: int = 16    # hardware backup floor (replaces soc_min_percent)
+    soc_min_percent: int = 16    # kept for LP fallback compatibility
     soc_max_percent: int = 95
+    load_history_days: int = 14  # rolling-mean window for load forecast
     dhw_tank_liters: int = 200
     dhw_max_temp: float = 58.0
     dhw_comfort_min: float = 45.0
@@ -33,15 +35,11 @@ class Config:
     dhw_cop: float = 3.0
     legionella_hours: int = 24
     ml_enabled: bool = True
-    shadow_mode: bool = True
+    shadow_mode: bool = True   # True = log + compute but don't issue service calls
     workday_entity: str = "binary_sensor.workday"
     workday_tomorrow_entity: str = "binary_sensor.workday_tomorrow"
     dhw_demand_hour_weekday: int = 7
     dhw_demand_hour_weekend: int = 9
-    force_soc_entity: str = "input_number.optimizer_force_soc_target"
-    force_soc_deadline_entity: str = "input_number.optimizer_force_soc_deadline_hour"
-    vacation_mode_entity: str = "input_boolean.optimizer_vacation_mode"
-    vacation_dhw_setpoint_entity: str = "input_number.optimizer_vacation_dhw_setpoint"
     deferrable_loads: list = field(default_factory=list)
 
     @classmethod
