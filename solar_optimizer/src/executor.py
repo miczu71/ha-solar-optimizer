@@ -1,128 +1,122 @@
-"""Translates optimizer schedule into HA service calls with anti-thrash logic.
+"""Translates a Plan into HA service calls.
 
-In shadow mode all calls are logged but not sent.
+Default: shadow mode — logs every intended action but sends nothing.
+Live mode: activated by config.shadow_mode=False AND the relevant switch_live flag.
+Anti-thrash: only sends a service call when the target value differs from last sent.
 """
 import logging
 from typing import Optional
 
 from config import Config
 from ha_client import HAClient
-from optimizer import OptimizeResult
+from planner import BatteryAction, DHWAction, ACAction, Plan
 
 log = logging.getLogger(__name__)
 
-HEAT_EPSILON_KWH = 0.02
-
-AC_ENTITIES = {
-    "salon": "climate.153931628323418_climate",
-    "pietro": "climate.152832117304366_climate",
-    "poddasze": "climate.152832117518705_climate",
-}
-
-AC_NOMINAL_SETPOINTS = {
-    "salon": 22.0,
-    "pietro": 22.0,
-    "poddasze": 22.0,
-}
+HEAT_EPSILON = 0.5  # °C — minimum setpoint change to trigger a write
 
 
 class Executor:
-    def __init__(self, cfg: Config, ha: HAClient, shadow: bool = True) -> None:
+    def __init__(self, cfg: Config, ha: HAClient) -> None:
         self._cfg = cfg
         self._ha = ha
-        self._shadow = shadow
         self._last_dhw_setpoint: Optional[float] = None
         self._last_dhw_restart_dt: Optional[float] = None
         self._last_ac_setpoints: dict[str, float] = {}
         self._forcible_charge_active = False
 
-    def apply_slot(
-        self,
-        slot: int,
-        result: OptimizeResult,
-        dhw_enabled: bool,
-        battery_enabled: bool,
-        ac_enabled: bool,
-    ) -> None:
-        if dhw_enabled:
-            self._apply_dhw(slot, result)
-        if battery_enabled:
-            self._apply_battery(slot, result)
-        if ac_enabled:
-            self._apply_ac(slot, result)
+    def _live(self, domain: str, mqtt_publisher) -> bool:
+        """Return True only when both shadow_mode is off AND the per-domain live switch is on."""
+        if self._cfg.shadow_mode:
+            return False
+        if domain == "battery":
+            return mqtt_publisher.is_battery_live()
+        if domain == "dhw":
+            return mqtt_publisher.is_dhw_live()
+        if domain == "ac":
+            return mqtt_publisher.is_ac_live()
+        return False
 
-    def _apply_dhw(self, slot: int, result: OptimizeResult) -> None:
-        heat = result.dhw_heat_energy[slot] if slot < len(result.dhw_heat_energy) else 0.0
+    def apply_plan(self, plan: Plan, mqtt_publisher, current_slot: int) -> None:
+        self._apply_battery(plan.battery, mqtt_publisher)
+        self._apply_dhw(plan.dhw, mqtt_publisher)
+        for ac_action in plan.ac_actions:
+            self._apply_ac(ac_action, mqtt_publisher)
 
-        try:
-            bath_req = self._ha.bath_request
-        except Exception:
-            bath_req = False
+    # ------------------------------------------------------------------
+    # Battery
+    # ------------------------------------------------------------------
 
-        if bath_req or heat > HEAT_EPSILON_KWH:
-            setpoint = self._cfg.dhw_solar_setpoint
-            restart_dt = self._cfg.dhw_restart_dt_aggressive
+    def _apply_battery(self, action: BatteryAction, mqtt) -> None:
+        live = self._live("battery", mqtt)
+
+        if action.type == "grid_charge":
+            if not self._forcible_charge_active:
+                pw = min(action.grid_charge_power_w, self._cfg.battery_max_charge_power_w)
+                log.info("Battery: forcible_charge %d W / 30 min (live=%s rule=%s)", pw, live, action.rule)
+                if live:
+                    self._ha.forcible_charge(duration_min=30, power_w=pw)
+                self._forcible_charge_active = True
         else:
-            setpoint = self._cfg.dhw_baseline_setpoint
-            restart_dt = self._cfg.dhw_restart_dt_default
+            if self._forcible_charge_active:
+                log.info("Battery: stop_forcible_charge (live=%s rule=%s)", live, action.rule)
+                if live:
+                    self._ha.stop_forcible_charge()
+                self._forcible_charge_active = False
 
-        self._write_dhw(setpoint, restart_dt)
+    # ------------------------------------------------------------------
+    # DHW
+    # ------------------------------------------------------------------
 
-    def _write_dhw(self, setpoint: float, restart_dt: float) -> None:
-        if setpoint != self._last_dhw_setpoint:
-            log.info("DHW setpoint -> %.1fdegC (shadow=%s)", setpoint, self._shadow)
-            if not self._shadow:
-                self._ha.set_dhw_setpoint(setpoint)
-            self._last_dhw_setpoint = setpoint
+    def _apply_dhw(self, action: DHWAction, mqtt) -> None:
+        live = self._live("dhw", mqtt)
 
-        if restart_dt != self._last_dhw_restart_dt:
-            log.info("DHW restart_dt -> %.1fdegC (shadow=%s)", restart_dt, self._shadow)
-            if not self._shadow:
-                self._ha.set_dhw_restart_dt(restart_dt)
-            self._last_dhw_restart_dt = restart_dt
+        if self._last_dhw_setpoint is None or abs(action.setpoint - self._last_dhw_setpoint) >= HEAT_EPSILON:
+            log.info("DHW: setpoint %.1f°C (live=%s) — %s", action.setpoint, live, action.reason)
+            if live:
+                self._ha.set_dhw_setpoint(action.setpoint)
+            self._last_dhw_setpoint = action.setpoint
 
-    def _apply_battery(self, slot: int, result: OptimizeResult) -> None:
-        target_w = result.offpeak_precharge_w[slot] if slot < len(result.offpeak_precharge_w) else 0.0
+        if self._last_dhw_restart_dt is None or abs(action.restart_dt - self._last_dhw_restart_dt) >= 0.1:
+            log.info("DHW: restart_dt %.1f°C (live=%s)", action.restart_dt, live)
+            if live:
+                self._ha.set_dhw_restart_dt(action.restart_dt)
+            self._last_dhw_restart_dt = action.restart_dt
 
-        if target_w > 50 and not self._forcible_charge_active:
-            power_w = int(min(target_w, self._cfg.battery_max_charge_power_w))
-            log.info("Forcible charge -> %d W for 30 min (shadow=%s)", power_w, self._shadow)
-            if not self._shadow:
-                self._ha.forcible_charge(duration_min=30, power_w=power_w)
-            self._forcible_charge_active = True
-        elif target_w <= 50 and self._forcible_charge_active:
-            log.info("Stop forcible charge (shadow=%s)", self._shadow)
-            if not self._shadow:
-                self._ha.stop_forcible_charge()
-            self._forcible_charge_active = False
+    # ------------------------------------------------------------------
+    # AC
+    # ------------------------------------------------------------------
 
-    def _apply_ac(self, slot: int, result: OptimizeResult) -> None:
-        for unit, entity_id in AC_ENTITIES.items():
-            delta = result.ac_deltas.get(unit, [0.0] * 48)
-            if slot >= len(delta):
-                continue
-            d = delta[slot]
-            target = AC_NOMINAL_SETPOINTS[unit] + d
-            last = self._last_ac_setpoints.get(unit)
-            if last is None or abs(target - last) >= 0.5:
-                log.info("AC %s setpoint -> %.1fdegC (shadow=%s)", unit, target, self._shadow)
-                if not self._shadow:
-                    self._ha.set_ac_setpoint(entity_id, target)
-                self._last_ac_setpoints[unit] = target
+    def _apply_ac(self, action: ACAction, mqtt) -> None:
+        live = self._live("ac", mqtt)
+        nominal = 22.0
+        target = nominal + action.setpoint_delta
+        last = self._last_ac_setpoints.get(action.unit)
+        if last is None or abs(target - last) >= 0.5:
+            log.info("AC %s: setpoint %.1f°C (live=%s) — %s", action.unit, target, live, action.reason)
+            if live:
+                self._ha.set_ac_setpoint(action.entity_id, target)
+            self._last_ac_setpoints[action.unit] = target
 
-    def failsafe(self) -> None:
-        log.warning("Executor failsafe triggered -- restoring defaults (shadow=%s)", self._shadow)
-        if not self._shadow:
+    # ------------------------------------------------------------------
+    # Failsafe
+    # ------------------------------------------------------------------
+
+    def failsafe(self, mqtt_publisher=None) -> None:
+        live_dhw = self._live("dhw", mqtt_publisher) if mqtt_publisher else False
+        live_bat = self._live("battery", mqtt_publisher) if mqtt_publisher else False
+        log.warning("Executor failsafe triggered (live_dhw=%s live_bat=%s)", live_dhw, live_bat)
+        if live_dhw:
             try:
                 self._ha.set_dhw_setpoint(self._cfg.dhw_baseline_setpoint)
                 self._ha.set_dhw_restart_dt(self._cfg.dhw_restart_dt_default)
             except Exception as exc:
-                log.error("DHW failsafe write failed: %s", exc)
+                log.error("DHW failsafe failed: %s", exc)
+        if live_bat and self._forcible_charge_active:
             try:
-                if self._forcible_charge_active:
-                    self._ha.stop_forcible_charge()
+                self._ha.stop_forcible_charge()
             except Exception as exc:
-                log.error("Battery failsafe write failed: %s", exc)
+                log.error("Battery failsafe failed: %s", exc)
         self._last_dhw_setpoint = None
         self._last_dhw_restart_dt = None
         self._forcible_charge_active = False

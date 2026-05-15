@@ -1,95 +1,94 @@
 # ha-solar-optimizer
 
-EMHASS-like energy optimizer for Home Assistant, built for a Huawei solar+battery stack with a
+Rule-based energy optimizer for Home Assistant, built for a Huawei solar+battery stack with a
 Heiko heat pump and Midea ACs on the Polish Tauron G12W two-tier tariff.
 
 ## What it does
 
-- Runs every 30 minutes, computing a 24-hour (48-slot) optimal dispatch schedule
-- Maximizes solar self-consumption by shifting flexible loads into PV-surplus windows
-- Minimizes grid import cost using the G12W peak/off-peak price signal (1.23 / 0.63 PLN/kWh)
-- Rewards keeping battery full at end-of-day to buffer overnight discharge
-- Ships in **shadow mode** by default — logs what it would do without touching any controls
-- Dashboard compares the optimizer plan against the existing JIT battery automation in real time
+Runs every 30 minutes and answers one question: **"What should the battery, heat pump, and ACs do right now to make the most of today's solar forecast?"**
 
-## Controlled loads
+- Evaluates five explicit battery rules (see below) using the Solcast PV forecast and a rolling load estimate
+- Schedules off-peak grid pre-charging when tomorrow's peak demand will exceed PV production
+- Shifts DHW heating into PV-surplus windows (free solar hot water)
+- Pre-cools ACs in the 30 minutes before peak tariff to reduce peak-hour consumption
+- Ships in **shadow mode** by default — computes and logs plans without issuing any HA service calls
+- Dashboard shows live flows, the active rule, the plan for the next 48h, and hypothetical savings
 
-| Load | Control |
-|------|----------|
-| Heat pump DHW | Raises setpoint to 58°C + tight hysteresis during PV surplus; coasts at 48°C otherwise |
-| Huawei battery | Optional off-peak forcible pre-charge when PV forecast won't cover peak demand |
-| 3× Midea AC | ±2°C setpoint pre-conditioning before peak tariff windows |
+## Dashboard
+
+Single-page ingress UI with two panels:
+
+**Top strip** — updates every 30 s:
+```
+Battery 67% (3.35/5.0 kWh)  |  PV 1.8 kW  |  Load 1.2 kW  |  Grid -0.3 kW (importing)
+Plan: grid-charge tonight 23:00–04:00 → 92%
+Rule: R3  |  Reason: Tomorrow peak load 14 kWh, PV during peak 6 kWh, shortfall 8 kWh
+Mode: SHADOW  |  Today hypothetical savings*: 4.20 PLN  |  This month: 87 PLN
+```
+
+**Bottom chart** — 48-hour timeline:
+- PV forecast (dashed yellow) and PV actual (solid yellow)
+- Load forecast (dashed grey) and load actual (solid grey)
+- Planned SoC trajectory (dashed blue) and actual SoC (solid blue)
+- Peak-tariff hours: light red background shading
+- Grid-charge windows: light blue background shading
+- "now" vertical marker
+
+*Shadow savings are hypothetical and approximate — see tooltip on the dashboard.
+
+## Battery rules
+
+| Rule | Trigger | Action |
+|------|---------|--------|
+| **R0 SAFETY** | SoC < 16% reserve | Idle — protect battery |
+| **R1 PV charge** | PV > load AND SoC < 95% | Natural charging logged — no service call needed |
+| **R2 Peak guard** | Peak tariff now active | Idle — never grid-charge during peak |
+| **R3 Pre-peak top-up** | Off-peak window AND shortfall forecast | `forcible_charge` until target SoC reached |
+| **R4 Export day** | PV surplus covers load + free battery | Idle — export surplus |
+| **R5 Idle** | None of the above | No action |
+
+## Entities (MQTT-discovered)
+
+| Entity | Type | Description |
+|--------|------|-------------|
+| `sensor.solar_optimizer_status` | sensor | Live status summary |
+| `sensor.solar_optimizer_plan_summary` | sensor | One-line plan sentence |
+| `sensor.solar_optimizer_savings_today` | sensor | Hypothetical savings today (PLN)* |
+| `sensor.solar_optimizer_savings_month` | sensor | Hypothetical savings this month (PLN)* |
+| `sensor.solar_optimizer_mode` | sensor | "shadow" or "live" |
+| `switch.solar_optimizer_battery_live` | switch | Enable live battery dispatch |
+| `switch.solar_optimizer_dhw_live` | switch | Enable live DHW dispatch |
+| `switch.solar_optimizer_ac_live` | switch | Enable live AC dispatch |
 
 ## Installation
 
 1. Add this repository to HA Supervisor → Add-on store
 2. Install **Solar Optimizer**
-3. Configure InfluxDB and MQTT credentials in the add-on options
-4. Start the add-on — shadow mode is on by default
-5. Review `sensor.optimizer_*` entities and the dashboard for plan quality
+3. Configure MQTT credentials in the add-on options (InfluxDB optional)
+4. Start the add-on — **shadow mode is on by default**
+5. Copy `packages/solar_optimizer.yaml` into your HA `packages/` directory and reload
 
-## Dashboard
+## Rollout
 
-Access via HA ingress (sidebar) or `http://addon-host:8099`.
+| Stage | Action | How long |
+|-------|--------|----------|
+| 0 Shadow | All switches OFF; watch chart and savings | 1–2 weeks |
+| 1 Battery live | Flip `switch.solar_optimizer_battery_live` ON; disable existing JIT battery automation | 1 week |
+| 2 DHW live | Flip `switch.solar_optimizer_dhw_live` ON; disable DHW surplus automations | 1 week |
+| 3 AC live | Flip `switch.solar_optimizer_ac_live` ON | ongoing |
 
-| Tab | Contents |
-|-----|----------|
-| **Status** | Last replan, solver status, PV/load forecast; collapsible assumptions & objective panel |
-| **Today's Plan** | 48-slot energy-flow chart, SoC + DHW temperature chart, full slot table |
-| **History** | Per-day self-consumption and grid import (accumulates over time) |
-| **Compare** | Live side-by-side: JIT automation state vs. optimizer plan + SoC trajectory chart |
-
-## LP objective
-
-```
-minimize:
-  1.0 × Σ grid_import[t]                    # maximize self-consumption
-  + 0.3 × Σ price[t] × grid_import[t]       # prefer off-peak for unavoidable imports
-  + 0.05 × Σ |dhw[t] − dhw[t−1]|           # anti-thrash
-  + 0.02 × Σ (pv_to_bat[t] + bat_to_load[t]) # battery wear
-  − 0.15 × soc[midnight]                    # reward full battery before overnight drain
-```
-
-## Rollout stages
-
-| Stage | What's live | Enable when |
-|-------|-------------|-------------|
-| 0 — Shadow | Plans published, no writes | Default; 2+ weeks recommended |
-| 1 — DHW | Heat pump setpoint/hysteresis writes | After shadow mode validates DHW plan |
-| 2 — Battery | Off-peak forcible pre-charge | After DHW stage is stable |
-| 3 — AC | ±2°C setpoint adjustments | After battery stage is stable |
-| 4 — ML | LightGBM replaces rolling-mean forecast | After ≥30 days of operational data |
-
-## MQTT entities
-
-| Entity | Description |
-|--------|-------------|
-| `sensor.optimizer_status` | Last run time, phase, solver status |
-| `sensor.optimizer_self_consumption_today` | % of PV consumed locally |
-| `sensor.optimizer_grid_import_avoided_kwh` | kWh saved vs. naive baseline |
-| `sensor.optimizer_battery_plan` | 48-slot forcible-charge plan (W) |
-| `sensor.optimizer_dhw_next_window` | Next scheduled DHW heating slot |
-| `sensor.optimizer_load_forecast_kwh` | Predicted total load next 24h |
-| `switch.optimizer_enabled` | Global on/off |
-| `switch.optimizer_battery_control` | Enable battery dispatch |
-| `switch.optimizer_dhw_control` | Enable DHW dispatch |
-| `switch.optimizer_ac_control` | Enable AC pre-conditioning |
+Live mode requires *both* `config.shadow_mode: false` in add-on options AND the relevant switch ON.
 
 ## Configuration options
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `shadow_mode` | `true` | Publish plans without writing to HA |
-| `replan_interval_minutes` | `30` | How often to recompute |
-| `battery_capacity_kwh` | `5.0` | Huawei LUNA capacity |
-| `soc_min_percent` | `10` | Hard battery floor |
-| `dhw_comfort_min` | `45` | Minimum DHW tank temp (°C) |
-| `dhw_solar_setpoint` | `58` | Setpoint when heating from surplus |
-| `dhw_baseline_setpoint` | `48` | Setpoint when coasting |
-| `ml_enabled` | `true` | Use LightGBM after ≥30 days of data |
-
-## Version history
-
-See [CHANGELOG.md](CHANGELOG.md) for full release notes.
-
-Current version: **0.3.1**
+| `battery_capacity_kwh` | 5.0 | Battery capacity (kWh) |
+| `battery_max_charge_power_w` | 2500 | Max charge power (W) |
+| `soc_reserve_pct` | 16 | Hardware backup floor (%) |
+| `soc_max_percent` | 95 | Charge ceiling (%) |
+| `load_history_days` | 14 | Rolling-mean window for load forecast |
+| `shadow_mode` | true | Compute but don't issue service calls |
+| `replan_interval_minutes` | 30 | How often to replan |
+| `dhw_*` | various | DHW setpoints and hysteresis |
+| `workday_entity` | `binary_sensor.workday` | G12W calendar — peak hours only on workdays |

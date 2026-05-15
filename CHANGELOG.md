@@ -5,6 +5,65 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [0.4.0] — 2026-05-15
+
+### Changed (breaking — total refactor)
+
+**Architecture**
+- Replaced the LP-only optimizer with a **rule-based planner** (`planner.py`) as the primary decision engine. Five explicit battery rules (R0 safety, R1 PV charge, R2 peak guard, R3 pre-peak top-up, R4 export day, R5 idle) plus simple DHW and AC heuristics. LP solver (`optimizer_lp.py`) retained as fallback for ambiguous cases only.
+- Added `tariff.py` — pure G12W calendar logic (`is_peak`, `next_offpeak_window`, `peak_vector_96`). No more hard-coded weight tuning.
+- Added `shadow_log.py` — rolling 30-day SQLite log of planned vs. actual energy flows, computing hypothetical savings (PLN) per slot.
+
+**UI — complete redesign**
+- Replaced multi-tab dashboard with a **two-panel single-page layout**:
+  - **Panel 1 (top)**: live status strip — battery %, PV kW, load kW, grid direction, active plan sentence, rule fired, shadow mode indicator, hypothetical savings today/this month.
+  - **Panel 2 (bottom)**: single 48-hour timeline Chart.js chart showing PV forecast, PV actual, load forecast, load actual, planned SoC (dashed), actual SoC (solid), peak-hour shading (light red), grid-charge window shading (light blue), "now" vertical marker.
+- Chart data served via `/api/timeline` FastAPI endpoint — **no more MQTT chart-data sensors** in HA's recorder.
+
+**MQTT entities reduced from 15+ to 8**
+- 5 sensors: `solar_optimizer_status`, `solar_optimizer_plan_summary`, `solar_optimizer_savings_today`, `solar_optimizer_savings_month`, `solar_optimizer_mode`
+- 3 switches: `solar_optimizer_battery_live`, `solar_optimizer_dhw_live`, `solar_optimizer_ac_live`
+- Removed: `solar_optimizer_optimizer_*` double-prefixed entities, all per-slot chart sensors, `enabled` master switch.
+
+**Battery constants updated**
+- `soc_reserve_pct` default changed from 10% to **16%** (actual Huawei hardware backup floor).
+- `load_history_days` option added (default 14 days rolling mean for load forecast).
+
+**HA package (`solar_optimizer.yaml`) updated**
+- Entity refs updated to new short names.
+- Removed template sensors that referenced deleted chart-data sensors.
+- Failsafe automations split into per-domain triggers (`battery_live` off → stop_forcible_charge; `dhw_live` off → restore DHW defaults).
+- Morning brief uses `sensor.solar_optimizer_plan_summary` and now includes savings.
+
+### Migration from v0.3.x
+1. After installing v0.4.0 and restarting the add-on, the 8 new entities will appear automatically.
+2. Clear old retained MQTT discovery messages (otherwise HA keeps showing stale entities):
+   ```
+   # Run in HA terminal or SSH add-on:
+   mosquitto_pub -h core-mosquitto -t "homeassistant/sensor/solar_optimizer_status/config" -n -r
+   mosquitto_pub -h core-mosquitto -t "homeassistant/sensor/solar_optimizer_self_consumption_today/config" -n -r
+   mosquitto_pub -h core-mosquitto -t "homeassistant/sensor/solar_optimizer_grid_import_avoided_kwh/config" -n -r
+   mosquitto_pub -h core-mosquitto -t "homeassistant/sensor/solar_optimizer_battery_plan/config" -n -r
+   mosquitto_pub -h core-mosquitto -t "homeassistant/sensor/solar_optimizer_dhw_next_window/config" -n -r
+   mosquitto_pub -h core-mosquitto -t "homeassistant/sensor/solar_optimizer_load_forecast_kwh/config" -n -r
+   mosquitto_pub -h core-mosquitto -t "homeassistant/sensor/solar_optimizer_load_forecast_error_24h/config" -n -r
+   mosquitto_pub -h core-mosquitto -t "homeassistant/sensor/solar_optimizer_pv_surplus_triggered_today/config" -n -r
+   mosquitto_pub -h core-mosquitto -t "homeassistant/sensor/solar_optimizer_savings_pln/config" -n -r
+   mosquitto_pub -h core-mosquitto -t "homeassistant/sensor/solar_optimizer_morning_plan/config" -n -r
+   mosquitto_pub -h core-mosquitto -t "homeassistant/sensor/solar_optimizer_planned_pv_w/config" -n -r
+   mosquitto_pub -h core-mosquitto -t "homeassistant/sensor/solar_optimizer_planned_load_w/config" -n -r
+   mosquitto_pub -h core-mosquitto -t "homeassistant/sensor/solar_optimizer_planned_grid_import_w/config" -n -r
+   mosquitto_pub -h core-mosquitto -t "homeassistant/sensor/solar_optimizer_planned_soc_pct/config" -n -r
+   mosquitto_pub -h core-mosquitto -t "homeassistant/sensor/solar_optimizer_planned_dhw_temp_c/config" -n -r
+   mosquitto_pub -h core-mosquitto -t "homeassistant/switch/solar_optimizer_enabled/config" -n -r
+   mosquitto_pub -h core-mosquitto -t "homeassistant/switch/solar_optimizer_battery_control/config" -n -r
+   mosquitto_pub -h core-mosquitto -t "homeassistant/switch/solar_optimizer_dhw_control/config" -n -r
+   mosquitto_pub -h core-mosquitto -t "homeassistant/switch/solar_optimizer_ac_control/config" -n -r
+   ```
+3. Reload `/config/packages/solar_optimizer.yaml` (Developer Tools → YAML → Reload All).
+
+---
+
 ## [0.3.18] — 2026-04-28
 
 ### Changed

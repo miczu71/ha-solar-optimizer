@@ -1,5 +1,4 @@
-"""Entrypoint: initializes all subsystems, starts APScheduler and FastAPI."""
-import json
+"""Entrypoint: initializes subsystems, wires planner → shadow_log → executor, starts scheduler + API."""
 import logging
 import re
 import sys
@@ -13,14 +12,16 @@ from apscheduler.schedulers.background import BackgroundScheduler
 
 from api import app, set_state
 from config import Config
-from data_pipeline import build_forecast_row, build_training_features_ha_stats
 from executor import Executor
-from forecaster import LoadForecaster
 from ha_client import HAClient
 from ha_statistics_client import get_ha_statistics_30min
 from mqtt_publisher import MQTTPublisher
-from optimizer import OptimizeResult, run_optimizer
-from thermal_calibrator import load_params
+from planner import Planner, Plan
+from tariff import (
+    OFFPEAK_PRICE, PEAK_PRICE,
+    is_peak, peak_vector_96,
+)
+import shadow_log
 
 logging.basicConfig(
     level=logging.INFO,
@@ -31,12 +32,9 @@ log = logging.getLogger("main")
 
 CONSECUTIVE_FAILURE_LIMIT = 3
 _consecutive_failures = 0
-_HISTORY_FILE = "/data/plan_history.jsonl"
-_HISTORY_MAX_RECORDS = 1440  # ~30 days at 48 replans/day
-_learned_params: dict = {}
 
 
-def _read_addon_version() -> str:
+def _read_version() -> str:
     try:
         with open("/app/addon_config.yaml") as f:
             for line in f:
@@ -48,30 +46,42 @@ def _read_addon_version() -> str:
     return "unknown"
 
 
-def build_pv_forecast(ha: HAClient) -> list[float]:
-    """Parse Solcast detailedForecast into 48-slot kWh array."""
+# ------------------------------------------------------------------
+# PV forecast helpers
+# ------------------------------------------------------------------
+
+def build_pv_forecast_96(ha: HAClient) -> list[float]:
+    """Return 96-slot kW array: today (0-47) + tomorrow (48-95) from Solcast."""
     slots_raw = ha.get_solcast_forecast()
-    by_slot: dict[int, float] = {}
+    today_by_slot: dict[int, float] = {}
+    tomorrow_by_slot: dict[int, float] = {}
     now_local = ha.local_now
+    today_date = now_local.date()
+    tomorrow_date = (now_local + timedelta(days=1)).date()
+
     for entry in slots_raw:
         try:
             period_start = entry.get("period_start") or entry.get("PeriodStart") or ""
             if not period_start:
                 continue
             dt = datetime.fromisoformat(period_start.replace("Z", "+00:00"))
-            dt_local = dt.astimezone(ha.tz) if dt.tzinfo else dt.replace(tzinfo=ha.tz)
-            if dt_local.date() != now_local.date():
-                continue
+            dt_local = dt.astimezone(ha.tz)
             slot = dt_local.hour * 2 + dt_local.minute // 30
             kw = float(entry.get("pv_estimate", entry.get("PvEstimate", 0)))
-            by_slot[slot] = kw * 0.5
+            if dt_local.date() == today_date:
+                today_by_slot[slot] = kw
+            elif dt_local.date() == tomorrow_date:
+                tomorrow_by_slot[slot] = kw
         except Exception:
             continue
-    return [by_slot.get(s, 0.0) for s in range(48)]
+
+    today = [today_by_slot.get(s, 0.0) for s in range(48)]
+    tomorrow = [tomorrow_by_slot.get(s, 0.0) for s in range(48)]
+    return today + tomorrow
 
 
-def _rolling_mean_ha_stats(days_back: int = 7) -> pd.Series:
-    """Per-slot mean base load (kWh/slot) from HA long-term statistics."""
+def _rolling_mean(days_back: int) -> pd.Series:
+    """Per-slot mean base load (kW) from HA long-term statistics."""
     try:
         entity_ids = [
             "sensor.house_consumption_power",
@@ -89,305 +99,181 @@ def _rolling_mean_ha_stats(days_back: int = 7) -> pd.Series:
         ac_d  = stats.get("sensor.miernik_energii_klimatyzacje_power_b", empty)
         df = pd.concat([house, hp, ac_p, ac_d], axis=1, join="outer").fillna(0)
         df.columns = ["house", "hp", "ac_p", "ac_d"]
-        # W → kWh/30-min-slot; clip subtracted values at 0
-        df["base"] = ((df["house"] - df["hp"] - df["ac_p"] - df["ac_d"]).clip(lower=0)) * 0.5 / 1000
+        # Return base load in kW (subtract flexible loads, keep positive)
+        df["base_kw"] = (df["house"] - df["hp"] - df["ac_p"] - df["ac_d"]).clip(lower=0) / 1000
         df["slot"] = df.index.hour * 2 + df.index.minute // 30
-        return df.groupby("slot")["base"].mean()
+        return df.groupby("slot")["base_kw"].mean()
     except Exception as exc:
         log.debug("HA stats rolling mean (%dd) failed: %s", days_back, exc)
         return pd.Series(dtype=float)
 
 
-def _pv_total_yesterday_ha_stats(now_local: datetime) -> float:
-    """Yesterday's total PV generation (kWh) from HA long-term statistics."""
-    try:
-        stats = get_ha_statistics_30min(["sensor.inverter_input_power"], days_back=2)
-        pv_s = stats.get("sensor.inverter_input_power")
-        if pv_s is not None and not pv_s.empty:
-            yesterday = (now_local - timedelta(days=1)).date()
-            mask = pv_s.index.date == yesterday
-            if mask.any():
-                return float(pv_s[mask].sum() * 0.5 / 1000)
-    except Exception as exc:
-        log.debug("PV yesterday HA stats failed: %s", exc)
-    return 5.0
-
-
-def build_base_load_forecast(
-    forecaster: LoadForecaster,
-    ha: HAClient,
-    cfg: Config,
-    now_local: datetime,
-    phase: int,
-) -> list[float]:
-    if phase == 2 and forecaster.is_ready():
-        try:
-            outdoor = ha.outdoor_temp
-            lag_1d = _rolling_mean_ha_stats(days_back=1)
-            lag_7d = _rolling_mean_ha_stats(days_back=7)
-            pv_yesterday = _pv_total_yesterday_ha_stats(now_local)
-            rows = [
-                build_forecast_row(
-                    slot=s,
-                    now=now_local,
-                    outdoor_temp=outdoor,
-                    lag_1d=float(lag_1d.get(s, 0.3)) if not lag_1d.empty else 0.3,
-                    lag_7d=float(lag_7d.get(s, 0.3)) if not lag_7d.empty else 0.3,
-                    pv_yesterday_kwh=pv_yesterday,
-                )
-                for s in range(48)
-            ]
-            return forecaster.predict_48slots(rows)
-        except Exception as exc:
-            log.warning("LightGBM forecast failed, falling back to rolling mean: %s", exc)
-
-    rolling = _rolling_mean_ha_stats(days_back=7)
+def build_load_forecast_96(ha: HAClient, cfg: Config) -> list[float]:
+    """96-slot kW load forecast: rolling mean repeated for today + tomorrow."""
+    rolling = _rolling_mean(cfg.load_history_days)
     if not rolling.empty:
-        return [float(rolling.get(s, 0.3)) for s in range(48)]
-    log.warning("HA stats rolling mean empty, using flat 0.3 kWh/slot")
-    return [0.3] * 48
+        base = [float(rolling.get(s, 0.3)) for s in range(48)]
+    else:
+        log.warning("No HA stats for load forecast — using flat 0.3 kW/slot")
+        base = [0.3] * 48
+
+    # Tomorrow: same pattern (no seasonal adjustment in Phase 1)
+    return base + base
 
 
-def _find_best_deferrable_start(
-    pv_forecast: list[float],
-    base_load: list[float],
-    result: OptimizeResult,
-    load: dict,
-) -> Optional[int]:
-    """Sliding-window search for the slot that minimises additional grid import."""
-    power_w = load.get("power_w", 1000)
-    duration_slots = max(1, round(load.get("duration_min", 60) / 30))
-    earliest = int(load.get("earliest_slot", 0))
-    latest = int(load.get("latest_slot", 47))
-    load_kwh = power_w / 1000 * 0.5
+# ------------------------------------------------------------------
+# AC state reader
+# ------------------------------------------------------------------
 
-    best_slot, best_score = None, float("inf")
-    for start in range(earliest, min(latest - duration_slots + 2, 48 - duration_slots + 1)):
-        grid_added = 0.0
-        for t in range(start, start + duration_slots):
-            if t >= 48:
-                break
-            pv_surplus = max(0.0, pv_forecast[t] - base_load[t])
-            grid_added += max(0.0, load_kwh - pv_surplus)
-        if grid_added < best_score:
-            best_score = grid_added
-            best_slot = start
-    return best_slot
+def _ac_states(ha: HAClient) -> dict[str, str]:
+    units = {"salon": "climate.153931628323418_climate",
+             "pietro": "climate.152832117304366_climate",
+             "poddasze": "climate.152832117518705_climate"}
+    result = {}
+    for name, eid in units.items():
+        try:
+            result[name] = ha.get_state(eid).get("state", "off")
+        except Exception:
+            result[name] = "off"
+    return result
 
 
-def _save_daily_summary(result: OptimizeResult, now_local: datetime, phase: int) -> None:
-    try:
-        pv_total = sum(result.pv_forecast_kwh) if result.pv_forecast_kwh else result.pv_forecast_kwh_total
-        export_total = sum(result.grid_export_kwh)
-        import_total = sum(result.grid_import_kwh)
-        self_cons = max(0.0, (pv_total - export_total) / pv_total * 100) if pv_total > 0 else 0.0
-        record = {
-            "date": now_local.strftime("%Y-%m-%d"),
-            "time": now_local.isoformat(),
-            "phase": phase,
-            "pv_total_kwh": round(pv_total, 3),
-            "load_total_kwh": round(result.load_forecast_kwh_total, 3),
-            "grid_import_total_kwh": round(import_total, 3),
-            "grid_export_total_kwh": round(export_total, 3),
-            "self_cons_pct": round(self_cons, 1),
-        }
-        with open(_HISTORY_FILE, "a") as f:
-            f.write(json.dumps(record) + "\n")
-        with open(_HISTORY_FILE) as f:
-            lines = f.readlines()
-        if len(lines) > _HISTORY_MAX_RECORDS:
-            with open(_HISTORY_FILE, "w") as f:
-                f.writelines(lines[-_HISTORY_MAX_RECORDS:])
-    except Exception as exc:
-        log.warning("Failed to save plan history: %s", exc)
-
+# ------------------------------------------------------------------
+# Main replan function
+# ------------------------------------------------------------------
 
 def replan(
     cfg: Config,
     ha: HAClient,
+    planner: Planner,
     executor: Executor,
     mqtt: MQTTPublisher,
-    forecaster: LoadForecaster,
-    phase: int,
 ) -> None:
     global _consecutive_failures
     try:
-        if not mqtt.is_enabled():
-            log.info("Optimizer disabled via switch, skipping replan")
-            return
-
-        now_utc = datetime.now(timezone.utc)
         now_local = ha.local_now
+        current_slot = now_local.hour * 2 + now_local.minute // 30
 
-        pv_forecast = build_pv_forecast(ha)
-        base_load = build_base_load_forecast(forecaster, ha, cfg, now_local, phase)
+        workday_today    = ha.is_workday(cfg.workday_entity)
+        workday_tomorrow = ha.is_workday(cfg.workday_tomorrow_entity)
 
-        set_state("last_pv_forecast", pv_forecast)
-        set_state("last_base_load", base_load)
+        pv_96   = build_pv_forecast_96(ha)
+        load_96 = build_load_forecast_96(ha, cfg)
+        is_peak_96 = peak_vector_96(now_local, workday_today, workday_tomorrow)
 
-        soc = ha.soc_percent
-        soc_min = max(cfg.soc_min_percent, ha.soc_min_from_backup)
+        soc      = ha.soc_percent
+        pv_now   = ha.pv_power_w / 1000
+        load_now = ha.house_load_w / 1000
         dhw_temp = ha.dhw_tank_temp
-        outdoor = ha.outdoor_temp
+        outdoor  = ha.outdoor_temp
+        ac_states = _ac_states(ha)
+        bath_req  = ha.bath_request
 
-        slot = now_local.hour * 2 + now_local.minute // 30
-
-        is_workday = ha.is_workday(cfg.workday_entity)
-
-        demand_hour = cfg.dhw_demand_hour_weekday if is_workday else cfg.dhw_demand_hour_weekend
-        demand_slot = demand_hour * 2
-        dhw_demand_slots = [False] * 48
-        for t in range(demand_slot, min(48, demand_slot + 4)):
-            dhw_demand_slots[t] = True
-        if ha.bath_request:
-            demand_end = min(48, slot + 4)
-            for t in range(slot, demand_end):
-                dhw_demand_slots[t] = True
-            log.info("Bath requested: marking slots %d–%d as DHW demand", slot, demand_end - 1)
-
-        force_soc_pct = ha.get_ha_float(cfg.force_soc_entity, default=0.0)
-        force_soc_hour = int(ha.get_ha_float(cfg.force_soc_deadline_entity, default=8.0))
-        vacation_mode = ha.get_ha_bool(cfg.vacation_mode_entity)
-        vacation_dhw = (
-            ha.get_ha_float(cfg.vacation_dhw_setpoint_entity, default=55.0)
-            if vacation_mode else None
-        )
-        if force_soc_pct > 0:
-            log.info("Force-SoC override: target %.0f%% by %02d:00", force_soc_pct, force_soc_hour)
-        if vacation_mode:
-            log.info("Vacation mode: DHW setpoint %.0f°C", vacation_dhw)
-
-        result = run_optimizer(
-            cfg=cfg,
-            pv_forecast_kwh=pv_forecast,
-            base_load_kwh=base_load,
-            soc_init=soc,
-            soc_min=soc_min,
-            dhw_temp_init=dhw_temp,
-            dhw_demand_slots=dhw_demand_slots,
-            outdoor_temps=[outdoor] * 48,
-            ac_room_temps={u: 22.0 for u in ["salon", "pietro", "poddasze"]},
+        plan = planner.plan(
             now=now_local,
-            enable_battery=mqtt.is_battery_enabled(),
-            enable_dhw=mqtt.is_dhw_enabled(),
-            enable_ac=mqtt.is_ac_enabled(),
-            is_workday=is_workday,
-            force_soc_pct=force_soc_pct,
-            force_soc_deadline_hour=force_soc_hour,
-            vacation_dhw_setpoint=vacation_dhw,
-            learned_dhw_loss_rate=_learned_params.get("dhw_loss_rate_c_per_hour"),
-            learned_dhw_cop=_learned_params.get("dhw_cop"),
+            soc_pct=soc,
+            pv_now_kw=pv_now,
+            load_now_kw=load_now,
+            pv_forecast_kw_96=pv_96,
+            load_forecast_kw_96=load_96,
+            is_peak_96=is_peak_96,
+            workday_today=workday_today,
+            workday_tomorrow=workday_tomorrow,
+            dhw_tank_temp=dhw_temp,
+            outdoor_temp=outdoor,
+            ac_states=ac_states,
+            bath_requested=bath_req,
         )
 
-        if result.status != "Optimal":
-            log.error("Solver returned %s -- holding current setpoints", result.status)
-            _consecutive_failures += 1
-            if _consecutive_failures >= CONSECUTIVE_FAILURE_LIMIT:
-                executor.failsafe()
-                mqtt._switch_states["enabled"] = False
-            return
+        executor.apply_plan(plan, mqtt, current_slot)
 
-        _consecutive_failures = 0
+        # Shadow-mode benefit tracking
+        tariff_price = PEAK_PRICE if is_peak_96[current_slot] else OFFPEAK_PRICE
+        grid_kw = (ha.grid_export_w - ha.grid_import_w) / 1000  # positive = exporting
+        bat_delta_kw = (ha.battery_charge_w - ha.battery_discharge_w) / 1000  # pos = charging
 
-        if not cfg.shadow_mode:
-            executor.apply_slot(
-                slot=slot,
-                result=result,
-                dhw_enabled=mqtt.is_dhw_enabled(),
-                battery_enabled=mqtt.is_battery_enabled(),
-                ac_enabled=mqtt.is_ac_enabled(),
+        # Planned battery delta: positive means "plan wants to charge"
+        planned_bat_delta = 0.0
+        if plan.battery.type == "grid_charge":
+            planned_bat_delta = cfg.battery_max_charge_power_w / 1000
+        elif plan.battery.type == "pv_charge":
+            planned_bat_delta = max(0.0, pv_now - load_now)  # PV surplus going to battery
+        # idle / discharge: 0 (battery natural behaviour, not dispatcher-controlled)
+
+        slot_savings = shadow_log.record(
+            ts=datetime.now(timezone.utc),
+            slot=current_slot,
+            rule=plan.battery.rule,
+            actual_grid_kw=grid_kw,
+            actual_load_kw=load_now,
+            actual_pv_kw=pv_now,
+            planned_battery_delta_kw=planned_bat_delta,
+            tariff_price=tariff_price,
+        )
+
+        today_pln  = shadow_log.today_savings()
+        month_pln  = shadow_log.month_savings()
+
+        # Build plan summary sentence
+        bat = plan.battery
+        if bat.type == "grid_charge" and bat.grid_charge_start:
+            plan_text = (
+                f"Grid-charge {bat.grid_charge_start.strftime('%H:%M')}–"
+                f"{bat.grid_charge_end.strftime('%H:%M')} → {bat.target_soc_pct:.0f}%"
             )
+        elif bat.type == "pv_charge":
+            plan_text = f"Charging from PV ({pv_now:.1f} kW surplus) → battery at {soc:.0f}%"
         else:
-            log.info("Shadow mode: would apply slot %d DHW=%.3f kWh precharge=%.0f W",
-                     slot, result.dhw_heat_energy[slot], result.offpeak_precharge_w[slot])
+            plan_text = bat.reason
 
-        mqtt.publish_plan(result, phase=phase, last_run=now_utc)
-        mqtt.publish_current_slot(result, slot, dhw_cop=cfg.dhw_cop)
-        set_state("last_result", result)
-        set_state("last_run", now_utc)
-        set_state("phase", phase)
+        mqtt.publish_status(
+            f"Battery {soc:.0f}% | PV {pv_now:.1f} kW | Grid {'export' if grid_kw>0 else 'import'} {abs(grid_kw):.1f} kW",
+            last_run=datetime.now(timezone.utc),
+            rule=bat.rule,
+        )
+        mqtt.publish_plan_summary(plan_text)
+        mqtt.publish_savings(today_pln, month_pln)
+        mqtt.publish_mode(cfg.shadow_mode)
 
-        pv_total = sum(pv_forecast)
-        if pv_total > 0:
-            self_cons = max(0.0, (pv_total - sum(result.grid_export_kwh)) / pv_total * 100)
-            mqtt.publish_self_consumption(self_cons)
+        # Share state with the API (dashboard)
+        set_state("last_plan", plan)
+        set_state("last_run", datetime.now(timezone.utc))
+        set_state("pv_96", pv_96)
+        set_state("load_96", load_96)
+        set_state("is_peak_96", is_peak_96)
+        set_state("cfg", cfg)
+        set_state("ha", ha)
+        set_state("savings_today", today_pln)
+        set_state("savings_month", month_pln)
 
-        naive_import = sum(max(0.0, base_load[t] - pv_forecast[t]) for t in range(48))
-        avoided = max(0.0, naive_import - sum(result.grid_import_kwh))
-        mqtt.publish_grid_import_avoided(avoided)
-
-        mqtt.publish_savings(result.savings_pln, result.optimized_cost_pln)
-
-        # Deferrable load scheduling (advisory)
-        load_starts: list[tuple[str, str]] = []
-        for load_cfg in cfg.deferrable_loads:
-            name = load_cfg.get("name", "load")
-            threshold_w = float(load_cfg.get("run_threshold_w", 50))
-
-            already_ran = False
-            if "power_entity" in load_cfg:
-                try:
-                    already_ran = ha.device_ran_today_ha(load_cfg["power_entity"], threshold_w)
-                except Exception as exc:
-                    log.debug("already-ran check failed for '%s': %s", name, exc)
-            if already_ran:
-                log.info("Deferrable load '%s' already ran today — skipping", name)
-                continue
-
-            best_slot = _find_best_deferrable_start(pv_forecast, base_load, result, load_cfg)
-            if best_slot is not None:
-                h, m = divmod(best_slot * 30, 60)
-                start_str = f"{h:02d}:{m:02d}"
-                load_starts.append((name, start_str))
-                mqtt.publish_deferrable_load(name, start_str)
-                log.info("Deferrable load '%s': best start %s", name, start_str)
-
-        mqtt.publish_morning_plan(result, pv_forecast, base_load, load_starts, is_workday,
-                                  force_soc_pct=force_soc_pct, vacation_mode=vacation_mode)
-
-        _save_daily_summary(result, now_local, phase)
+        log.info(
+            "Replan OK rule=%s pv=%.1f kWh load=%.1f kWh soc=%.0f%% shadow_savings=%.2f PLN",
+            bat.rule,
+            sum(pv_96[:48]),
+            sum(load_96[:48]),
+            soc,
+            today_pln,
+        )
+        _consecutive_failures = 0
 
     except Exception as exc:
         log.error("Replan error: %s", exc, exc_info=True)
         _consecutive_failures += 1
         if _consecutive_failures >= CONSECUTIVE_FAILURE_LIMIT:
-            log.critical("Too many consecutive failures -- triggering failsafe")
-            executor.failsafe()
-
-
-def _try_train(cfg: Config, forecaster: LoadForecaster) -> int:
-    """Attempt ML training from HA long-term statistics; return phase (2 if trained, 1 otherwise)."""
-    if not cfg.ml_enabled:
-        return 1
-    if forecaster.is_ready():
-        return 2
-    log.info("Attempting LightGBM training from HA long-term statistics (up to 365 days)")
-    try:
-        ha_df = build_training_features_ha_stats(days_back=365)
-        if not ha_df.empty and forecaster.train_from_df(ha_df):
-            return 2
-    except Exception as exc:
-        log.warning("HA statistics training failed: %s", exc)
-    return 1
+            log.critical("Too many consecutive failures — triggering failsafe")
+            executor.failsafe(mqtt)
 
 
 def main() -> None:
-    global _learned_params
     cfg = Config.load()
-    version = _read_addon_version()
+    version = _read_version()
     log.info("Starting Solar Optimizer v%s shadow_mode=%s", version, cfg.shadow_mode)
-
-    stored = load_params()
-    if stored:
-        _learned_params = stored
-        log.info("Loaded learned thermal params: loss_rate=%.3f °C/h  cop=%.2f",
-                 stored.get("dhw_loss_rate_c_per_hour", 0), stored.get("dhw_cop", 0))
 
     ha = HAClient(cfg)
     ha.init_timezone()
-    forecaster = LoadForecaster()
     mqtt = MQTTPublisher(cfg)
-    executor = Executor(cfg, ha, shadow=cfg.shadow_mode)
+    planner = Planner(cfg)
+    executor = Executor(cfg, ha)
 
     mqtt.connect()
 
@@ -397,32 +283,23 @@ def main() -> None:
         daemon=True,
     )
     server_thread.start()
-    log.info("HTTP server starting on port 8099")
+    log.info("HTTP server started on port 8099")
 
-    phase = _try_train(cfg, forecaster)
-    set_state("phase", phase)
     set_state("version", version)
     set_state("cfg", cfg)
     set_state("ha", ha)
+    set_state("replan_fn", lambda: replan(cfg, ha, planner, executor, mqtt))
 
-    def _replan():
-        replan(cfg, ha, executor, mqtt, forecaster, phase)
-
-    def _retrain():
-        nonlocal phase
-        new_phase = _try_train(cfg, forecaster)
-        if new_phase != phase:
-            log.info("Phase changed %d -> %d after retrain", phase, new_phase)
-            phase = new_phase
-        set_state("phase", phase)
-
-    set_state("replan_fn", _replan)
-
-    _replan()
+    replan(cfg, ha, planner, executor, mqtt)
 
     scheduler = BackgroundScheduler()
-    scheduler.add_job(_replan, "interval", minutes=cfg.replan_interval_minutes, id="replan", max_instances=1)
-    scheduler.add_job(_retrain, "cron", day_of_week="sun", hour=3, id="retrain")
+    scheduler.add_job(
+        lambda: replan(cfg, ha, planner, executor, mqtt),
+        "interval",
+        minutes=cfg.replan_interval_minutes,
+        id="replan",
+        max_instances=1,
+    )
     scheduler.start()
     log.info("Scheduler started, replan every %d min", cfg.replan_interval_minutes)
 
