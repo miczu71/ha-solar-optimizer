@@ -70,13 +70,18 @@ def api_status() -> JSONResponse:
     plan_text   = "Waiting for first replan…"
     plan_reason = ""
     rule        = "?"
+    tz = ha.tz if ha else None
+
+    def _local(dt: datetime) -> datetime:
+        return dt.astimezone(tz) if (tz and dt) else dt
+
     if plan:
         bat = plan.battery
         rule = bat.rule
         if bat.type == "grid_charge" and bat.grid_charge_start:
             plan_text = (
-                f"Grid-charge {bat.grid_charge_start.strftime('%H:%M')}–"
-                f"{bat.grid_charge_end.strftime('%H:%M')} → {bat.target_soc_pct:.0f}%"
+                f"Grid-charge {_local(bat.grid_charge_start).strftime('%H:%M')}–"
+                f"{_local(bat.grid_charge_end).strftime('%H:%M')} → {bat.target_soc_pct:.0f}%"
             )
         elif bat.type == "pv_charge":
             plan_text = f"Charging from PV → battery at {soc:.0f}%"
@@ -84,7 +89,7 @@ def api_status() -> JSONResponse:
             plan_text = bat.reason
         plan_reason = bat.reason
 
-    last_run_str = last_run.strftime("%H:%M:%S") if last_run else "—"
+    last_run_str = _local(last_run).strftime("%H:%M:%S") if last_run else "—"
 
     grid_dir = "exporting" if grid_kw > 0.05 else ("importing" if grid_kw < -0.05 else "balanced")
 
