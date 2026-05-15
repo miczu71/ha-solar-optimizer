@@ -5,7 +5,7 @@ Live mode: activated by config.shadow_mode=False AND the relevant switch_live fl
 Anti-thrash: only sends a service call when the target value differs from last sent.
 """
 import logging
-from typing import Optional
+from typing import Literal, Optional
 
 from config import Config
 from ha_client import HAClient
@@ -25,8 +25,7 @@ class Executor:
         self._last_ac_setpoints: dict[str, float] = {}
         self._forcible_charge_active = False
 
-    def _live(self, domain: str, mqtt_publisher) -> bool:
-        """Return True only when both shadow_mode is off AND the per-domain live switch is on."""
+    def _live(self, domain: Literal["battery", "dhw", "ac"], mqtt_publisher) -> bool:
         if self._cfg.shadow_mode:
             return False
         if domain == "battery":

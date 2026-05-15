@@ -16,10 +16,11 @@ from executor import Executor
 from ha_client import HAClient
 from ha_statistics_client import get_ha_statistics_30min
 from mqtt_publisher import MQTTPublisher
-from planner import Planner, Plan
+from planner import Planner, Plan, format_plan_text
 from tariff import (
-    OFFPEAK_PRICE, PEAK_PRICE,
-    is_peak, peak_vector_96,
+    datetime_to_slot,
+    peak_vector_96,
+    price_at,
 )
 import shadow_log
 
@@ -152,7 +153,7 @@ def replan(
     global _consecutive_failures
     try:
         now_local = ha.local_now
-        current_slot = now_local.hour * 2 + now_local.minute // 30
+        current_slot = datetime_to_slot(now_local)
 
         workday_today    = ha.is_workday(cfg.workday_entity)
         workday_tomorrow = ha.is_workday(cfg.workday_tomorrow_entity)
@@ -187,21 +188,18 @@ def replan(
 
         executor.apply_plan(plan, mqtt, current_slot)
 
-        # Shadow-mode benefit tracking
-        tariff_price = PEAK_PRICE if is_peak_96[current_slot] else OFFPEAK_PRICE
-        grid_kw = (ha.grid_export_w - ha.grid_import_w) / 1000  # positive = exporting
-        bat_delta_kw = (ha.battery_charge_w - ha.battery_discharge_w) / 1000  # pos = charging
+        now_utc = datetime.now(timezone.utc)
+        tariff_price = price_at(now_local, workday_today)
+        grid_kw = ha.grid_net_w / 1000
 
-        # Planned battery delta: positive means "plan wants to charge"
         planned_bat_delta = 0.0
         if plan.battery.type == "grid_charge":
             planned_bat_delta = cfg.battery_max_charge_power_w / 1000
         elif plan.battery.type == "pv_charge":
-            planned_bat_delta = max(0.0, pv_now - load_now)  # PV surplus going to battery
-        # idle / discharge: 0 (battery natural behaviour, not dispatcher-controlled)
+            planned_bat_delta = max(0.0, pv_now - load_now)
 
         slot_savings = shadow_log.record(
-            ts=datetime.now(timezone.utc),
+            ts=now_utc,
             slot=current_slot,
             rule=plan.battery.rule,
             actual_grid_kw=grid_kw,
@@ -214,21 +212,12 @@ def replan(
         today_pln  = shadow_log.today_savings()
         month_pln  = shadow_log.month_savings()
 
-        # Build plan summary sentence
         bat = plan.battery
-        if bat.type == "grid_charge" and bat.grid_charge_start:
-            plan_text = (
-                f"Grid-charge {bat.grid_charge_start.strftime('%H:%M')}–"
-                f"{bat.grid_charge_end.strftime('%H:%M')} → {bat.target_soc_pct:.0f}%"
-            )
-        elif bat.type == "pv_charge":
-            plan_text = f"Charging from PV ({pv_now:.1f} kW surplus) → battery at {soc:.0f}%"
-        else:
-            plan_text = bat.reason
+        plan_text = format_plan_text(bat, soc, pv_surplus_kw=(pv_now - load_now) if bat.type == "pv_charge" else None)
 
         mqtt.publish_status(
             f"Battery {soc:.0f}% | PV {pv_now:.1f} kW | Grid {'export' if grid_kw>0 else 'import'} {abs(grid_kw):.1f} kW",
-            last_run=datetime.now(timezone.utc),
+            last_run=now_utc,
             rule=bat.rule,
         )
         mqtt.publish_plan_summary(plan_text)
@@ -237,7 +226,7 @@ def replan(
 
         # Share state with the API (dashboard)
         set_state("last_plan", plan)
-        set_state("last_run", datetime.now(timezone.utc))
+        set_state("last_run", now_utc)
         set_state("pv_96", pv_96)
         set_state("load_96", load_96)
         set_state("is_peak_96", is_peak_96)

@@ -14,6 +14,11 @@ PEAK_PRICE = 1.23    # PLN/kWh
 OFFPEAK_PRICE = 0.63  # PLN/kWh
 
 
+def datetime_to_slot(dt: datetime) -> int:
+    """Convert a local datetime to a 30-min slot index (0–47)."""
+    return dt.hour * 2 + dt.minute // 30
+
+
 def is_peak(dt: datetime, workday: bool) -> bool:
     """Return True if dt falls in G12W peak hours."""
     if not workday:

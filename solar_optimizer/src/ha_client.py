@@ -7,6 +7,7 @@ from zoneinfo import ZoneInfo
 import httpx
 
 from config import Config
+from tariff import datetime_to_slot
 
 log = logging.getLogger(__name__)
 
@@ -74,24 +75,30 @@ class HAClient:
         return self.get_state_value("number.battery_backup_power_soc", default=10.0)
 
     @property
+    def grid_net_w(self) -> float:
+        """Signed grid power: positive = exporting, negative = importing."""
+        return self.get_state_value("sensor.power_meter_active_power")
+
+    @property
     def grid_import_w(self) -> float:
-        raw = self.get_state_value("sensor.power_meter_active_power")
-        return max(0.0, -raw)
+        return max(0.0, -self.grid_net_w)
 
     @property
     def grid_export_w(self) -> float:
-        raw = self.get_state_value("sensor.power_meter_active_power")
-        return max(0.0, raw)
+        return max(0.0, self.grid_net_w)
+
+    @property
+    def battery_net_w(self) -> float:
+        """Signed battery power: positive = charging, negative = discharging."""
+        return self.get_state_value("sensor.battery_charge_discharge_power")
 
     @property
     def battery_charge_w(self) -> float:
-        raw = self.get_state_value("sensor.battery_charge_discharge_power")
-        return max(0.0, raw)
+        return max(0.0, self.battery_net_w)
 
     @property
     def battery_discharge_w(self) -> float:
-        raw = self.get_state_value("sensor.battery_charge_discharge_power")
-        return max(0.0, -raw)
+        return max(0.0, -self.battery_net_w)
 
     @property
     def pv_power_w(self) -> float:
@@ -128,9 +135,6 @@ class HAClient:
         except Exception as exc:
             log.warning("Could not read workday entity %s (%s) — falling back to weekday check", entity_id, exc)
             return self.local_now.weekday() < 5
-
-    def get_ha_float(self, entity_id: str, default: float = 0.0) -> float:
-        return self.get_state_value(entity_id, default=default)
 
     def get_ha_bool(self, entity_id: str) -> bool:
         return self.get_state_str(entity_id, default="off").lower() in ("on", "true", "1")
@@ -173,7 +177,7 @@ class HAClient:
                         val = float(pt["state"])
                         ts = datetime.fromisoformat(pt["last_changed"].replace("Z", "+00:00"))
                         ts_local = ts.astimezone(self.tz)
-                        slot = ts_local.hour * 2 + ts_local.minute // 30
+                        slot = datetime_to_slot(ts_local)
                         if 0 <= slot < 48:
                             sums[eid][slot] += val
                             counts[eid][slot] += 1

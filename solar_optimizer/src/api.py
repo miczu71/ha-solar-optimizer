@@ -9,15 +9,15 @@ API endpoints:
   GET /api/timeline  full 96-slot dataset for the chart (fetched on load + every 30 min)
   POST /api/replan   force an immediate replan
 """
-import json
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Any, Optional
 
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse, JSONResponse
 
-from tariff import is_peak, PEAK_PRICE, OFFPEAK_PRICE
+from planner import format_plan_text
+from tariff import datetime_to_slot
 
 log = logging.getLogger(__name__)
 app = FastAPI(title="Solar Optimizer")
@@ -60,7 +60,7 @@ def api_status() -> JSONResponse:
             soc     = ha.soc_percent
             pv_kw   = ha.pv_power_w / 1000
             load_kw = ha.house_load_w / 1000
-            grid_kw = (ha.grid_export_w - ha.grid_import_w) / 1000
+            grid_kw = ha.grid_net_w / 1000
         except Exception:
             pass
 
@@ -72,24 +72,16 @@ def api_status() -> JSONResponse:
     rule        = "?"
     tz = ha.tz if ha else None
 
-    def _local(dt: datetime) -> datetime:
-        return dt.astimezone(tz) if (tz and dt) else dt
-
     if plan:
         bat = plan.battery
         rule = bat.rule
-        if bat.type == "grid_charge" and bat.grid_charge_start:
-            plan_text = (
-                f"Grid-charge {_local(bat.grid_charge_start).strftime('%H:%M')}–"
-                f"{_local(bat.grid_charge_end).strftime('%H:%M')} → {bat.target_soc_pct:.0f}%"
-            )
-        elif bat.type == "pv_charge":
-            plan_text = f"Charging from PV → battery at {soc:.0f}%"
-        else:
-            plan_text = bat.reason
+        plan_text = format_plan_text(bat, soc)
         plan_reason = bat.reason
 
-    last_run_str = _local(last_run).strftime("%H:%M:%S") if last_run else "—"
+    def _local_str(dt: datetime) -> str:
+        return (dt.astimezone(tz) if tz else dt).strftime("%H:%M:%S")
+
+    last_run_str = _local_str(last_run) if last_run else "—"
 
     grid_dir = "exporting" if grid_kw > 0.05 else ("importing" if grid_kw < -0.05 else "balanced")
 
@@ -134,10 +126,7 @@ def api_timeline() -> JSONResponse:
         labels.append(f"{h:02d}:{m:02d}+1")
 
     # Current slot (index into today's 48-slot array)
-    current_slot = 0
-    if ha:
-        nl = ha.local_now
-        current_slot = nl.hour * 2 + nl.minute // 30
+    current_slot = datetime_to_slot(ha.local_now) if ha else 0
 
     # Actual values for past slots from HA history (today only, slots 0 → current_slot)
     actual_pv: list[Optional[float]] = [None] * 96
@@ -188,8 +177,7 @@ def api_timeline() -> JSONResponse:
     if plan and plan.battery.type == "grid_charge" and plan.battery.grid_charge_start:
         bat = plan.battery
         if ha:
-            nl = ha.local_now
-            midnight = nl.replace(hour=0, minute=0, second=0, microsecond=0)
+            midnight = ha.local_now.replace(hour=0, minute=0, second=0, microsecond=0)
             start_slot = int((bat.grid_charge_start - midnight).total_seconds() / 1800)
             end_slot   = int((bat.grid_charge_end   - midnight).total_seconds() / 1800)
             # Clamp to 0-47; if overnight wrap to tomorrow (48-95)

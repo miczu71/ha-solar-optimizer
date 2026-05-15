@@ -24,6 +24,7 @@ from typing import Literal, Optional
 
 from tariff import (
     OffpeakWindow,
+    datetime_to_slot,
     is_peak,
     next_offpeak_window,
     offpeak_hours_remaining_tonight,
@@ -74,14 +75,24 @@ class Plan:
     battery: BatteryAction
     dhw: DHWAction
     ac_actions: list[ACAction]
-    # 96-slot arrays covering today (0-47) and tomorrow (48-95)
     pv_forecast_kw: list[float] = field(default_factory=list)
     load_forecast_kw: list[float] = field(default_factory=list)
     is_peak_96: list[bool] = field(default_factory=list)
-    # 49-point SoC trajectory for the rest of today (from current slot to slot 47+1)
     soc_trajectory: list[float] = field(default_factory=list)
-    # Savings estimate (PLN) if this plan were executed vs. current automations
     savings_estimate_pln: float = 0.0
+
+
+def format_plan_text(bat: BatteryAction, soc_pct: float, pv_surplus_kw: Optional[float] = None) -> str:
+    """One-line plan summary for the status strip and MQTT."""
+    if bat.type == "grid_charge" and bat.grid_charge_start:
+        return (
+            f"Grid-charge {bat.grid_charge_start.strftime('%H:%M')}–"
+            f"{bat.grid_charge_end.strftime('%H:%M')} → {bat.target_soc_pct:.0f}%"
+        )
+    if bat.type == "pv_charge":
+        surplus = f" ({pv_surplus_kw:.1f} kW surplus)" if pv_surplus_kw is not None else ""
+        return f"Charging from PV{surplus} → battery at {soc_pct:.0f}%"
+    return bat.reason
 
 
 class Planner:
@@ -106,8 +117,7 @@ class Planner:
     ) -> Plan:
         cfg = self._cfg
 
-        # Current slot index in today's 48-slot day
-        current_slot = now.hour * 2 + now.minute // 30
+        current_slot = datetime_to_slot(now)
 
         # Battery constants
         cap = cfg.battery_capacity_kwh
@@ -140,7 +150,7 @@ class Planner:
             "Plan rule=%s reason=%s | DHW=%s | AC=%d units",
             battery_action.rule, battery_action.reason,
             dhw_action.type,
-            len([a for a in ac_actions if a.setpoint_delta != 0]),
+            sum(1 for a in ac_actions if a.setpoint_delta != 0),
         )
 
         return Plan(
@@ -262,7 +272,6 @@ class Planner:
             if i < len(is_peak_96) and is_peak_96[i]:
                 load_val = load_96[i] if i < len(load_96) else 0.5
                 pv_val = pv_96[i] if i < len(pv_96) else 0.0
-                # kW × 0.5h = kWh per slot
                 peak_load += load_val * 0.5
                 pv_peak += pv_val * 0.5
         return peak_load, pv_peak
