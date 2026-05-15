@@ -1,6 +1,6 @@
 name: "Solar Optimizer"
 description: "Rule-based battery + DHW + AC optimizer for Huawei solar stack with G12W tariff. Shadow mode by default."
-version: "0.4.3"
+version: "0.4.4"
 slug: "solar_optimizer"
 init: false
 arch:

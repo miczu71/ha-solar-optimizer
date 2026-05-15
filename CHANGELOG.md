@@ -5,6 +5,29 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [0.4.4] — 2026-05-15
+
+### Fixed
+- **Entity ID double-prefix** (`solar_optimizer_optimizer_*`): MQTT discovery entity names all started with "Optimizer" (e.g. "Optimizer Status"). Because HA generates entity_id as `{device_slug}_{entity_name_slug}` and the device slug is already `solar_optimizer`, this produced `sensor.solar_optimizer_optimizer_status`. Fixed by removing the "Optimizer" prefix from all entity names ("Status", "Plan Summary", etc.) so IDs are now the expected `sensor.solar_optimizer_status`.
+- Changed `unique_id` prefix from `solar_optimizer_` to `so_` to force fresh entity registration — HA doesn't rename existing entities when only the name changes.
+
+### Migration (clear stale entities after update)
+Run in HA terminal or SSH add-on:
+```bash
+# Clear v0.4.0–v0.4.3 wrong-named entities (solar_optimizer_optimizer_*)
+mosquitto_pub -h core-mosquitto -t "homeassistant/sensor/solar_optimizer_status/config" -n -r
+mosquitto_pub -h core-mosquitto -t "homeassistant/sensor/solar_optimizer_plan_summary/config" -n -r
+mosquitto_pub -h core-mosquitto -t "homeassistant/sensor/solar_optimizer_savings_today/config" -n -r
+mosquitto_pub -h core-mosquitto -t "homeassistant/sensor/solar_optimizer_savings_month/config" -n -r
+mosquitto_pub -h core-mosquitto -t "homeassistant/sensor/solar_optimizer_mode/config" -n -r
+mosquitto_pub -h core-mosquitto -t "homeassistant/switch/solar_optimizer_battery_live/config" -n -r
+mosquitto_pub -h core-mosquitto -t "homeassistant/switch/solar_optimizer_dhw_live/config" -n -r
+mosquitto_pub -h core-mosquitto -t "homeassistant/switch/solar_optimizer_ac_live/config" -n -r
+```
+After clearing, restart the add-on — 8 new entities will register with correct IDs.
+
+---
+
 ## [0.4.0] — 2026-05-15
 
 ### Changed (breaking — total refactor)

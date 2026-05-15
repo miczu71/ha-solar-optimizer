@@ -23,40 +23,40 @@ NODE_ID = "solar_optimizer"
 
 SENSOR_CONFIGS: dict[str, dict] = {
     "status": {
-        "name": "Optimizer Status",
+        "name": "Status",
         "icon": "mdi:solar-power-variant",
         "value_template": "{{ value_json.state }}",
     },
     "plan_summary": {
-        "name": "Optimizer Plan Summary",
+        "name": "Plan Summary",
         "icon": "mdi:battery-clock",
         "value_template": "{{ value_json.state }}",
     },
     "savings_today": {
-        "name": "Optimizer Savings Today",
+        "name": "Savings Today",
         "unit_of_measurement": "PLN",
         "icon": "mdi:cash-plus",
         "state_class": "measurement",
         "value_template": "{{ value_json.state }}",
     },
     "savings_month": {
-        "name": "Optimizer Savings This Month",
+        "name": "Savings Month",
         "unit_of_measurement": "PLN",
         "icon": "mdi:cash-multiple",
         "state_class": "total_increasing",
         "value_template": "{{ value_json.state }}",
     },
     "mode": {
-        "name": "Optimizer Mode",
+        "name": "Mode",
         "icon": "mdi:eye-outline",
         "value_template": "{{ value_json.state }}",
     },
 }
 
 SWITCH_CONFIGS: dict[str, str] = {
-    "battery_live": "Optimizer Battery Live",
-    "dhw_live":     "Optimizer DHW Live",
-    "ac_live":      "Optimizer AC Live",
+    "battery_live": "Battery Live",
+    "dhw_live":     "DHW Live",
+    "ac_live":      "AC Live",
 }
 
 
@@ -113,7 +113,7 @@ class MQTTPublisher:
         }
         for name, extra in SENSOR_CONFIGS.items():
             config = {
-                "unique_id": f"{NODE_ID}_{name}",
+                "unique_id": f"so_{name}",
                 "state_topic": self._state_topic("sensor", name),
                 "device": device,
                 **extra,
@@ -126,7 +126,7 @@ class MQTTPublisher:
 
         for name, friendly in SWITCH_CONFIGS.items():
             config = {
-                "unique_id": f"{NODE_ID}_{name}",
+                "unique_id": f"so_{name}",
                 "name": friendly,
                 "state_topic": self._state_topic("switch", name),
                 "command_topic": f"{DISCOVERY_PREFIX}/switch/{NODE_ID}_{name}/set",
