@@ -1,6 +1,6 @@
 name: "Solar Optimizer"
-description: "EMHASS-like ML energy optimizer for Huawei solar+battery, heat pump DHW, and Midea AC dispatch"
-version: "0.3.18"
+description: "Rule-based battery + DHW + AC optimizer for Huawei solar stack with G12W tariff. Shadow mode by default."
+version: "0.4.0"
 slug: "solar_optimizer"
 init: false
 arch:
@@ -26,8 +26,9 @@ options:
   battery_capacity_kwh: 5.0
   battery_max_charge_power_w: 2500
   battery_max_discharge_power_w: 2500
-  soc_min_percent: 10
+  soc_reserve_pct: 16
   soc_max_percent: 95
+  load_history_days: 14
   dhw_tank_liters: 200
   dhw_max_temp: 58
   dhw_comfort_min: 45
@@ -37,18 +38,12 @@ options:
   dhw_restart_dt_aggressive: 2
   dhw_loss_rate_c_per_hour: 0.8
   dhw_cop: 3.0
-  legionella_hours: 24
   ml_enabled: true
   shadow_mode: true
   workday_entity: "binary_sensor.workday"
   workday_tomorrow_entity: "binary_sensor.workday_tomorrow"
   dhw_demand_hour_weekday: 7
   dhw_demand_hour_weekend: 9
-  force_soc_entity: "input_number.optimizer_force_soc_target"
-  force_soc_deadline_entity: "input_number.optimizer_force_soc_deadline_hour"
-  vacation_mode_entity: "input_boolean.optimizer_vacation_mode"
-  vacation_dhw_setpoint_entity: "input_number.optimizer_vacation_dhw_setpoint"
-  deferrable_loads: []
 
 schema:
   ha_url: str
@@ -60,8 +55,9 @@ schema:
   battery_capacity_kwh: float
   battery_max_charge_power_w: int
   battery_max_discharge_power_w: int
-  soc_min_percent: int(0,50)
+  soc_reserve_pct: int(0,50)
   soc_max_percent: int(50,100)
+  load_history_days: int(7,90)
   dhw_tank_liters: int
   dhw_max_temp: int(50,65)
   dhw_comfort_min: int(40,55)
@@ -71,22 +67,9 @@ schema:
   dhw_restart_dt_aggressive: int(1,5)
   dhw_loss_rate_c_per_hour: float
   dhw_cop: float
-  legionella_hours: int(12,168)
   ml_enabled: bool
   shadow_mode: bool
   workday_entity: str
   workday_tomorrow_entity: str
   dhw_demand_hour_weekday: int(0,12)
   dhw_demand_hour_weekend: int(0,12)
-  force_soc_entity: str
-  force_soc_deadline_entity: str
-  vacation_mode_entity: str
-  vacation_dhw_setpoint_entity: str
-  deferrable_loads:
-    - name: str
-      power_w: int?
-      duration_min: int?
-      earliest_slot: int?
-      latest_slot: int?
-      power_entity: str?
-      run_threshold_w: float?
