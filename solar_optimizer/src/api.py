@@ -323,7 +323,7 @@ function cls(el, ...classes) { el.className = classes.join(' '); }
 // ---- status strip polling ----
 async function refreshStatus() {
   try {
-    const s = await fetch('/api/status').then(r => r.json());
+    const s = await fetch('api/status').then(r => r.json());
 
     const socKwh = (s.soc_pct / 100 * s.bat_cap_kwh).toFixed(2);
     $('soc').textContent = `${s.soc_pct.toFixed(1)}% (${socKwh}/${s.bat_cap_kwh} kWh)`;
@@ -443,7 +443,7 @@ const chargePlugin = {
 
 async function buildChart() {
   try {
-    const d = await fetch('/api/timeline').then(r => r.json());
+    const d = await fetch('api/timeline').then(r => r.json());
     $('loading').style.display = 'none';
 
     const canvas = $('timeline');
