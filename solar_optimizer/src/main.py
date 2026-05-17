@@ -21,7 +21,8 @@ from tariff import (
     datetime_to_slot,
     is_peak,
     peak_vector_96,
-    price_at,
+    PEAK_PRICE,
+    OFFPEAK_PRICE,
 )
 import shadow_log
 
@@ -190,9 +191,10 @@ def replan(
 
         executor.apply_plan(plan, mqtt, current_slot)
 
-        now_utc = datetime.now(timezone.utc)
-        tariff_price = price_at(now_local, workday_today)
-        grid_kw = ha.grid_net_w / 1000
+        now_utc      = datetime.now(timezone.utc)
+        is_peak_now  = is_peak(now_local, workday_today)
+        tariff_price = PEAK_PRICE if is_peak_now else OFFPEAK_PRICE
+        grid_kw      = ha.grid_net_w / 1000
 
         planned_bat_delta = 0.0
         if plan.battery.type == "grid_charge":
@@ -232,7 +234,6 @@ def replan(
         set_state("pv_96", pv_96)
         set_state("load_96", load_96)
         set_state("is_peak_96", is_peak_96)
-        set_state("cfg", cfg)
         set_state("ha", ha)
         set_state("savings_today",    today_pln)
         set_state("savings_month",    month_pln)
@@ -243,7 +244,7 @@ def replan(
         set_state("battery_kw",       battery_kw)
         set_state("dhw_plan",         plan.dhw)
         set_state("dhw_temp",         dhw_temp)
-        set_state("is_peak_now",      is_peak(now_local, workday_today))
+        set_state("is_peak_now",      is_peak_now)
         set_state("tariff_price",     tariff_price)
         set_state("workday_today",    workday_today)
         set_state("workday_tomorrow", workday_tomorrow)

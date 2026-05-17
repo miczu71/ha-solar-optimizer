@@ -17,7 +17,7 @@ from fastapi import FastAPI
 from fastapi.responses import HTMLResponse, JSONResponse
 
 from planner import format_plan_text
-from tariff import datetime_to_slot
+from tariff import datetime_to_slot, PEAK_PRICE, OFFPEAK_PRICE
 
 log = logging.getLogger(__name__)
 app = FastAPI(title="Solar Optimizer")
@@ -43,7 +43,7 @@ _state: dict[str, Any] = {
     "dhw_plan":         None,
     "dhw_temp":         0.0,
     "is_peak_now":      False,
-    "tariff_price":     0.63,
+    "tariff_price":     OFFPEAK_PRICE,
     "workday_today":    True,
     "workday_tomorrow": True,
 }
@@ -57,26 +57,33 @@ def _next_tariff_event(
     now: datetime, is_peak_now: bool, workday_today: bool, workday_tomorrow: bool
 ) -> str:
     """Return a short string: 'Peak ends 13:00 (1h 05m)' or 'Peak starts 15:00 (0h 45m)'."""
+    def _cd(verb: str, dt: datetime, suffix: str = "") -> str:
+        dm = max(0, int((dt - now).total_seconds() / 60))
+        return f"Peak {verb} {dt.strftime('%H:%M')}{suffix} ({dm // 60}h {dm % 60:02d}m)"
+
     h = now.hour
     if is_peak_now:
         end_h = 13 if h < 13 else 22
-        end_dt = now.replace(hour=end_h, minute=0, second=0, microsecond=0)
-        dm = max(0, int((end_dt - now).total_seconds() / 60))
-        return f"Peak ends {end_dt.strftime('%H:%M')} ({dm // 60}h {dm % 60:02d}m)"
+        return _cd("ends", now.replace(hour=end_h, minute=0, second=0, microsecond=0))
     if workday_today:
         if h < 6:
-            s = now.replace(hour=6, minute=0, second=0, microsecond=0)
-            dm = max(0, int((s - now).total_seconds() / 60))
-            return f"Peak starts {s.strftime('%H:%M')} ({dm // 60}h {dm % 60:02d}m)"
+            return _cd("starts", now.replace(hour=6, minute=0, second=0, microsecond=0))
         if 13 <= h < 15:
-            s = now.replace(hour=15, minute=0, second=0, microsecond=0)
-            dm = max(0, int((s - now).total_seconds() / 60))
-            return f"Peak starts {s.strftime('%H:%M')} ({dm // 60}h {dm % 60:02d}m)"
+            return _cd("starts", now.replace(hour=15, minute=0, second=0, microsecond=0))
     if workday_tomorrow:
-        s = (now + timedelta(days=1)).replace(hour=6, minute=0, second=0, microsecond=0)
-        dm = max(0, int((s - now).total_seconds() / 60))
-        return f"Peak starts {s.strftime('%H:%M')}+1 ({dm // 60}h {dm % 60:02d}m)"
+        return _cd("starts", (now + timedelta(days=1)).replace(hour=6, minute=0, second=0, microsecond=0), "+1")
     return "Off-peak (no peak soon)"
+
+
+def _ffill(vals: list) -> list:
+    """Forward-fill None gaps in a slot array."""
+    out, last = list(vals), None
+    for i, v in enumerate(out):
+        if v is not None:
+            last = v
+        elif last is not None:
+            out[i] = last
+    return out
 
 
 # ------------------------------------------------------------------
@@ -99,7 +106,7 @@ def api_status() -> JSONResponse:
     dhw_plan    = _state.get("dhw_plan")
     dhw_temp    = _state.get("dhw_temp", 0.0)
     is_peak_now      = _state.get("is_peak_now", False)
-    tariff_price     = _state.get("tariff_price", 0.63)
+    tariff_price     = _state.get("tariff_price", OFFPEAK_PRICE)
     workday_today    = _state.get("workday_today", True)
     workday_tomorrow = _state.get("workday_tomorrow", True)
 
@@ -187,15 +194,6 @@ def api_timeline() -> JSONResponse:
                 "sensor.battery_state_of_capacity",
             ])
 
-            def _ffill(vals: list) -> list:
-                out, last = list(vals), None
-                for i, v in enumerate(out):
-                    if v is not None:
-                        last = v
-                    elif last is not None:
-                        out[i] = last
-                return out
-
             pv_slots   = _ffill(hist.get("sensor.inverter_input_power", [None] * 48))
             load_slots = _ffill(hist.get("sensor.house_consumption_power", [None] * 48))
             soc_slots  = _ffill(hist.get("sensor.battery_state_of_capacity", [None] * 48))
@@ -247,6 +245,8 @@ def api_timeline() -> JSONResponse:
         "charge_windows": charge_windows,
         "plan_rule":      (plan.battery.rule if plan else "?"),
         "plan_reason":    (plan.battery.reason if plan else ""),
+        "peak_price":     PEAK_PRICE,
+        "offpeak_price":  OFFPEAK_PRICE,
     })
 
 
@@ -355,9 +355,11 @@ _HTML = r"""<!DOCTYPE html>
   <div class="row">
     <span><span id="mode-tag" class="shadow">SHADOW</span></span>
     <span class="sep">|</span>
-    <span><span class="lbl">Today*</span><span id="sav-today" class="val pos" title="Positive = optimizer would save vs. actual. Negative = actual was cheaper (shadow plan not optimal yet).">&#8212;</span></span>
+    <span><span class="lbl">Today*</span><span id="sav-today" class="val pos"
+      title="Positive = optimizer would save vs. actual. Negative = actual was cheaper.">&#8212;</span></span>
     <span class="sep">|</span>
-    <span><span class="lbl">Month*</span><span id="sav-month" class="val pos" title="Cumulative 30-day hypothetical savings.">&#8212;</span></span>
+    <span><span class="lbl">Month*</span><span id="sav-month" class="val pos"
+      title="Cumulative 30-day hypothetical savings.">&#8212;</span></span>
     <span class="sep">|</span>
     <span><span class="lbl">v</span><span id="version" class="val">&#8212;</span></span>
     <span class="sep">|</span>
@@ -381,13 +383,15 @@ async function refreshStatus() {
   try {
     const s = await fetch('api/status').then(r => r.json());
 
-    // Battery: SoC% + direction arrow + kWh
-    const kwh    = (s.soc_pct / 100 * s.bat_cap_kwh).toFixed(2);
-    const bkw    = Math.abs(s.battery_kw).toFixed(2);
-    const arrow  = s.battery_dir === 'charging' ? '↑' : (s.battery_dir === 'discharging' ? '↓' : '→');
-    const socEl  = $('soc');
-    socEl.textContent = `${s.soc_pct.toFixed(1)}% ${arrow}${bkw}kW (${kwh}/${s.bat_cap_kwh}kWh)`;
-    cls(socEl, 'val', s.battery_dir === 'charging' ? 'pos' : (s.battery_dir === 'discharging' ? 'warn' : ''));
+    // Battery: SoC% + direction + charge rate + kWh
+    const kwh   = (s.soc_pct / 100 * s.bat_cap_kwh).toFixed(2);
+    const bkw   = Math.abs(s.battery_kw).toFixed(2);
+    const dir   = s.battery_dir;
+    const arrows  = {charging: '↑', discharging: '↓', idle: '→'};
+    const batCls  = {charging: 'pos', discharging: 'warn', idle: ''};
+    const socEl = $('soc');
+    socEl.textContent = `${s.soc_pct.toFixed(1)}% ${arrows[dir] || '→'}${bkw}kW (${kwh}/${s.bat_cap_kwh}kWh)`;
+    cls(socEl, 'val', batCls[dir] || '');
 
     $('pv').textContent   = `${s.pv_kw.toFixed(2)} kW`;
     $('load').textContent = `${s.load_kw.toFixed(2)} kW`;
@@ -420,7 +424,7 @@ async function refreshStatus() {
     cls(tariffEl, 'val', s.is_peak_now ? 'neg' : 'pos');
     $('tariff-event').textContent = s.tariff_event;
 
-    // Savings (negative = actual was cheaper)
+    // Savings
     const fmtSav = v => v >= 0 ? `+${v.toFixed(2)} PLN` : `${v.toFixed(2)} PLN`;
     $('sav-today').textContent = fmtSav(s.savings_today);
     cls($('sav-today'), 'val', s.savings_today >= 0 ? 'pos' : 'neg');
@@ -470,7 +474,6 @@ async function forceReplan() {
 // ---- Chart ----
 let chart = null;
 
-// "now" vertical line plugin
 const nowPlugin = {
   id: 'nowLine',
   afterDraw(chart) {
@@ -491,7 +494,6 @@ const nowPlugin = {
   }
 };
 
-// Peak-shading background plugin
 const peakPlugin = {
   id: 'peakShading',
   beforeDatasetsDraw(chart) {
@@ -504,7 +506,8 @@ const peakPlugin = {
     let inPeak = false, peakStart = 0;
     for (let i = 0; i < peaks.length; i++) {
       if (peaks[i] && !inPeak)       { inPeak = true; peakStart = i; }
-      else if (!peaks[i] && inPeak)  { inPeak = false;
+      else if (!peaks[i] && inPeak)  {
+        inPeak = false;
         ctx.fillRect(xs.getPixelForValue(peakStart), top,
                      xs.getPixelForValue(i) - xs.getPixelForValue(peakStart), bottom - top);
       }
@@ -517,7 +520,6 @@ const peakPlugin = {
   }
 };
 
-// Charge-window shading plugin
 const chargePlugin = {
   id: 'chargeShading',
   beforeDatasetsDraw(chart) {
@@ -546,10 +548,8 @@ async function buildChart() {
     const nowPos   = d.current_slot - winStart;
     const sl = arr => (arr || []).slice(winStart, winEnd + 1);
 
-    const winLabels  = sl(d.labels);
-    const tickLabels = winLabels.map((l, i) => ((winStart + i) % 4 === 0 ? l : ''));
+    const tickLabels = sl(d.labels).map((l, i) => ((winStart + i) % 4 === 0 ? l : ''));
 
-    // Adjust charge windows to windowed indices
     const chargeWindows = (d.charge_windows || [])
       .map(w => ({...w, start_slot: w.start_slot - winStart, end_slot: w.end_slot - winStart}))
       .filter(w => w.end_slot >= 0 && w.start_slot <= winEnd - winStart);
@@ -562,36 +562,24 @@ async function buildChart() {
     const BLUE_SOLID  = 'rgba(88, 166, 255, 1.0)';
 
     const datasets = [
-      {
-        label: 'PV forecast (kW)', yAxisID: 'y', data: sl(d.pv_forecast),
-        borderColor: YELLOW, backgroundColor: 'transparent',
-        borderWidth: 1.5, borderDash: [4, 3], pointRadius: 0, tension: 0.3,
-      },
-      {
-        label: 'PV actual (kW)', yAxisID: 'y', data: sl(d.actual_pv),
+      { label: 'PV forecast (kW)',   yAxisID: 'y',  data: sl(d.pv_forecast),
+        borderColor: YELLOW,      backgroundColor: 'transparent',
+        borderWidth: 1.5, borderDash: [4, 3], pointRadius: 0, tension: 0.3 },
+      { label: 'PV actual (kW)',     yAxisID: 'y',  data: sl(d.actual_pv),
         borderColor: YELLOW_DARK, backgroundColor: 'transparent',
-        borderWidth: 2.5, pointRadius: 0, tension: 0.3, spanGaps: false,
-      },
-      {
-        label: 'Load forecast (kW)', yAxisID: 'y', data: sl(d.load_forecast),
-        borderColor: GREY, backgroundColor: 'transparent',
-        borderWidth: 1.5, borderDash: [4, 3], pointRadius: 0, tension: 0.3,
-      },
-      {
-        label: 'Load actual (kW)', yAxisID: 'y', data: sl(d.actual_load),
-        borderColor: GREY_DARK, backgroundColor: 'transparent',
-        borderWidth: 2.5, pointRadius: 0, tension: 0.3, spanGaps: false,
-      },
-      {
-        label: 'Planned SoC (%)', yAxisID: 'y2', data: sl(d.planned_soc),
-        borderColor: BLUE_DASH, backgroundColor: 'transparent',
-        borderWidth: 1.5, borderDash: [5, 3], pointRadius: 0, tension: 0.3, spanGaps: false,
-      },
-      {
-        label: 'Actual SoC (%)', yAxisID: 'y2', data: sl(d.actual_soc),
-        borderColor: BLUE_SOLID, backgroundColor: 'transparent',
-        borderWidth: 2.5, pointRadius: 0, tension: 0.3, spanGaps: false,
-      },
+        borderWidth: 2.5, pointRadius: 0, tension: 0.3, spanGaps: false },
+      { label: 'Load forecast (kW)', yAxisID: 'y',  data: sl(d.load_forecast),
+        borderColor: GREY,        backgroundColor: 'transparent',
+        borderWidth: 1.5, borderDash: [4, 3], pointRadius: 0, tension: 0.3 },
+      { label: 'Load actual (kW)',   yAxisID: 'y',  data: sl(d.actual_load),
+        borderColor: GREY_DARK,   backgroundColor: 'transparent',
+        borderWidth: 2.5, pointRadius: 0, tension: 0.3, spanGaps: false },
+      { label: 'Planned SoC (%)',    yAxisID: 'y2', data: sl(d.planned_soc),
+        borderColor: BLUE_DASH,   backgroundColor: 'transparent',
+        borderWidth: 1.5, borderDash: [5, 3], pointRadius: 0, tension: 0.3, spanGaps: false },
+      { label: 'Actual SoC (%)',     yAxisID: 'y2', data: sl(d.actual_soc),
+        borderColor: BLUE_SOLID,  backgroundColor: 'transparent',
+        borderWidth: 2.5, pointRadius: 0, tension: 0.3, spanGaps: false },
     ];
 
     if (chart) { chart.destroy(); chart = null; }
@@ -618,7 +606,9 @@ async function buildChart() {
             callbacks: {
               title: items => {
                 const gi = winStart + items[0].dataIndex;
-                const price = d.is_peak[gi] ? '1.23 PLN/kWh' : '0.63 PLN/kWh';
+                const price = d.is_peak[gi]
+                  ? d.peak_price.toFixed(2) + ' PLN/kWh'
+                  : d.offpeak_price.toFixed(2) + ' PLN/kWh';
                 return `${d.labels[gi]}  ${d.is_peak[gi] ? 'PEAK' : 'off-peak'} • ${price}`;
               },
               afterBody: items => {
