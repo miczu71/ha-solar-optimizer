@@ -1,16 +1,16 @@
 """FastAPI ingress — two-panel dashboard.
 
-Panel 1 (top):  status strip — live battery/PV/grid values + plan sentence + mode/savings.
-Panel 2 (bottom): single 48-hour timeline chart (PV, load, SoC, peak shading).
+Panel 1 (top):  status strip — battery/PV/grid/DHW/tariff + plan + mode/savings.
+Panel 2 (bottom): rolling 48-hour timeline chart (PV, load, SoC, peak shading).
 
 API endpoints:
-  GET /           HTML dashboard
-  GET /api/status  live status for the top strip (polled every 30 s)
-  GET /api/timeline  full 96-slot dataset for the chart (fetched on load + every 30 min)
-  POST /api/replan   force an immediate replan
+  GET /             HTML dashboard
+  GET /api/status   live status for the top strip (polled every 30 s)
+  GET /api/timeline full 96-slot dataset for the chart (fetched on load + every 5 min)
+  POST /api/replan  force an immediate replan
 """
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Optional
 
 from fastapi import FastAPI
@@ -23,17 +23,29 @@ log = logging.getLogger(__name__)
 app = FastAPI(title="Solar Optimizer")
 
 _state: dict[str, Any] = {
-    "last_plan":     None,
-    "last_run":      None,
-    "version":       "?",
-    "cfg":           None,
-    "ha":            None,
-    "pv_96":         None,
-    "load_96":       None,
-    "is_peak_96":    None,
-    "savings_today": 0.0,
-    "savings_month": 0.0,
-    "replan_fn":     None,
+    "last_plan":        None,
+    "last_run":         None,
+    "version":          "?",
+    "cfg":              None,
+    "ha":               None,
+    "pv_96":            None,
+    "load_96":          None,
+    "is_peak_96":       None,
+    "savings_today":    0.0,
+    "savings_month":    0.0,
+    "replan_fn":        None,
+    # cached sensor values (updated by replan loop — no live HA reads in /api/status)
+    "soc_pct":          0.0,
+    "pv_kw":            0.0,
+    "load_kw":          0.0,
+    "grid_kw":          0.0,
+    "battery_kw":       0.0,
+    "dhw_plan":         None,
+    "dhw_temp":         0.0,
+    "is_peak_now":      False,
+    "tariff_price":     0.63,
+    "workday_today":    True,
+    "workday_tomorrow": True,
 }
 
 
@@ -41,36 +53,61 @@ def set_state(key: str, value: Any) -> None:
     _state[key] = value
 
 
+def _next_tariff_event(
+    now: datetime, is_peak_now: bool, workday_today: bool, workday_tomorrow: bool
+) -> str:
+    """Return a short string: 'Peak ends 13:00 (1h 05m)' or 'Peak starts 15:00 (0h 45m)'."""
+    h = now.hour
+    if is_peak_now:
+        end_h = 13 if h < 13 else 22
+        end_dt = now.replace(hour=end_h, minute=0, second=0, microsecond=0)
+        dm = max(0, int((end_dt - now).total_seconds() / 60))
+        return f"Peak ends {end_dt.strftime('%H:%M')} ({dm // 60}h {dm % 60:02d}m)"
+    if workday_today:
+        if h < 6:
+            s = now.replace(hour=6, minute=0, second=0, microsecond=0)
+            dm = max(0, int((s - now).total_seconds() / 60))
+            return f"Peak starts {s.strftime('%H:%M')} ({dm // 60}h {dm % 60:02d}m)"
+        if 13 <= h < 15:
+            s = now.replace(hour=15, minute=0, second=0, microsecond=0)
+            dm = max(0, int((s - now).total_seconds() / 60))
+            return f"Peak starts {s.strftime('%H:%M')} ({dm // 60}h {dm % 60:02d}m)"
+    if workday_tomorrow:
+        s = (now + timedelta(days=1)).replace(hour=6, minute=0, second=0, microsecond=0)
+        dm = max(0, int((s - now).total_seconds() / 60))
+        return f"Peak starts {s.strftime('%H:%M')}+1 ({dm // 60}h {dm % 60:02d}m)"
+    return "Off-peak (no peak soon)"
+
+
 # ------------------------------------------------------------------
-# /api/status  — live sensor snapshot (polled every 30 s by the UI)
+# /api/status  — reads from cached _state; no live HA calls
 # ------------------------------------------------------------------
 
 @app.get("/api/status")
 def api_status() -> JSONResponse:
-    ha  = _state.get("ha")
-    cfg = _state.get("cfg")
+    ha   = _state.get("ha")
+    cfg  = _state.get("cfg")
     plan = _state.get("last_plan")
     last_run: Optional[datetime] = _state.get("last_run")
+    tz   = ha.tz if ha else None
 
-    soc = pv_kw = load_kw = grid_kw = 0.0
-    mode = "shadow"
+    soc         = _state.get("soc_pct", 0.0)
+    pv_kw       = _state.get("pv_kw", 0.0)
+    load_kw     = _state.get("load_kw", 0.0)
+    grid_kw     = _state.get("grid_kw", 0.0)
+    battery_kw  = _state.get("battery_kw", 0.0)
+    dhw_plan    = _state.get("dhw_plan")
+    dhw_temp    = _state.get("dhw_temp", 0.0)
+    is_peak_now      = _state.get("is_peak_now", False)
+    tariff_price     = _state.get("tariff_price", 0.63)
+    workday_today    = _state.get("workday_today", True)
+    workday_tomorrow = _state.get("workday_tomorrow", True)
 
-    if ha:
-        try:
-            soc     = ha.soc_percent
-            pv_kw   = ha.pv_power_w / 1000
-            load_kw = ha.house_load_w / 1000
-            grid_kw = ha.grid_net_w / 1000
-        except Exception:
-            pass
-
-    if cfg:
-        mode = "shadow" if cfg.shadow_mode else "live"
+    mode = "shadow" if (cfg and cfg.shadow_mode) else "live"
 
     plan_text   = "Waiting for first replan…"
     plan_reason = ""
     rule        = "?"
-    tz = ha.tz if ha else None
 
     if plan:
         bat = plan.battery
@@ -81,9 +118,14 @@ def api_status() -> JSONResponse:
     def _local_str(dt: datetime) -> str:
         return (dt.astimezone(tz) if tz else dt).strftime("%H:%M:%S")
 
-    last_run_str = _local_str(last_run) if last_run else "—"
-
     grid_dir = "exporting" if grid_kw > 0.05 else ("importing" if grid_kw < -0.05 else "balanced")
+    bat_dir  = "charging" if battery_kw > 0.05 else ("discharging" if battery_kw < -0.05 else "idle")
+
+    now_local = ha.local_now if ha else None
+    tariff_event = (
+        _next_tariff_event(now_local, is_peak_now, workday_today, workday_tomorrow)
+        if now_local else "—"
+    )
 
     return JSONResponse({
         "soc_pct":         round(soc, 1),
@@ -91,14 +133,22 @@ def api_status() -> JSONResponse:
         "load_kw":         round(load_kw, 2),
         "grid_kw":         round(grid_kw, 2),
         "grid_dir":        grid_dir,
+        "battery_kw":      round(battery_kw, 2),
+        "battery_dir":     bat_dir,
         "bat_cap_kwh":     cfg.battery_capacity_kwh if cfg else 5.0,
+        "tariff_price":    tariff_price,
+        "is_peak_now":     is_peak_now,
+        "tariff_event":    tariff_event,
         "plan_text":       plan_text,
         "plan_reason":     plan_reason,
         "rule":            rule,
         "mode":            mode,
+        "dhw_type":        dhw_plan.type if dhw_plan else "unknown",
+        "dhw_reason":      dhw_plan.reason if dhw_plan else "—",
+        "dhw_temp":        round(dhw_temp, 1),
         "savings_today":   round(_state.get("savings_today", 0.0), 2),
         "savings_month":   round(_state.get("savings_month", 0.0), 2),
-        "last_run":        last_run_str,
+        "last_run":        _local_str(last_run) if last_run else "—",
         "version":         _state.get("version", "?"),
     })
 
@@ -110,13 +160,11 @@ def api_status() -> JSONResponse:
 @app.get("/api/timeline")
 def api_timeline() -> JSONResponse:
     ha       = _state.get("ha")
-    cfg      = _state.get("cfg")
     plan     = _state.get("last_plan")
     pv_96    = _state.get("pv_96") or ([0.0] * 96)
     load_96  = _state.get("load_96") or ([0.3] * 96)
     peak_96  = _state.get("is_peak_96") or ([False] * 96)
 
-    # Build slot labels: "HH:MM" for today, "HH:MM+1" for tomorrow
     labels = []
     for s in range(48):
         h, m = divmod(s * 30, 60)
@@ -125,10 +173,8 @@ def api_timeline() -> JSONResponse:
         h, m = divmod(s * 30, 60)
         labels.append(f"{h:02d}:{m:02d}+1")
 
-    # Current slot (index into today's 48-slot array)
     current_slot = datetime_to_slot(ha.local_now) if ha else 0
 
-    # Actual values for past slots from HA history (today only, slots 0 → current_slot)
     actual_pv: list[Optional[float]] = [None] * 96
     actual_load: list[Optional[float]] = [None] * 96
     actual_soc: list[Optional[float]] = [None] * 96
@@ -156,7 +202,7 @@ def api_timeline() -> JSONResponse:
 
             for s in range(current_slot + 1):
                 if pv_slots[s] is not None:
-                    actual_pv[s] = round(pv_slots[s] / 1000, 3)   # W → kW
+                    actual_pv[s] = round(pv_slots[s] / 1000, 3)
                 if load_slots[s] is not None:
                     actual_load[s] = round(load_slots[s] / 1000, 3)
                 if soc_slots[s] is not None:
@@ -164,7 +210,6 @@ def api_timeline() -> JSONResponse:
         except Exception as exc:
             log.warning("Timeline history fetch failed: %s", exc)
 
-    # Planned SoC trajectory (49 points starting at current_slot)
     planned_soc: list[Optional[float]] = [None] * 96
     if plan and plan.soc_trajectory:
         for i, val in enumerate(plan.soc_trajectory):
@@ -172,7 +217,6 @@ def api_timeline() -> JSONResponse:
             if slot_idx < 48:
                 planned_soc[slot_idx] = val
 
-    # Grid-charge windows from the plan (for chart annotation)
     charge_windows = []
     if plan and plan.battery.type == "grid_charge" and plan.battery.grid_charge_start:
         bat = plan.battery
@@ -180,7 +224,6 @@ def api_timeline() -> JSONResponse:
             midnight = ha.local_now.replace(hour=0, minute=0, second=0, microsecond=0)
             start_slot = int((bat.grid_charge_start - midnight).total_seconds() / 1800)
             end_slot   = int((bat.grid_charge_end   - midnight).total_seconds() / 1800)
-            # Clamp to 0-47; if overnight wrap to tomorrow (48-95)
             if start_slot < 0:
                 start_slot += 48
                 end_slot   += 48
@@ -192,18 +235,18 @@ def api_timeline() -> JSONResponse:
             })
 
     return JSONResponse({
-        "labels":        labels,
-        "current_slot":  current_slot,
-        "pv_forecast":   [round(v, 3) for v in pv_96],
-        "load_forecast": [round(v, 3) for v in load_96],
-        "actual_pv":     actual_pv,
-        "actual_load":   actual_load,
-        "actual_soc":    actual_soc,
-        "planned_soc":   planned_soc,
-        "is_peak":       peak_96,
+        "labels":         labels,
+        "current_slot":   current_slot,
+        "pv_forecast":    [round(v, 3) for v in pv_96],
+        "load_forecast":  [round(v, 3) for v in load_96],
+        "actual_pv":      actual_pv,
+        "actual_load":    actual_load,
+        "actual_soc":     actual_soc,
+        "planned_soc":    planned_soc,
+        "is_peak":        peak_96,
         "charge_windows": charge_windows,
-        "plan_rule":     (plan.battery.rule if plan else "?"),
-        "plan_reason":   (plan.battery.reason if plan else ""),
+        "plan_rule":      (plan.battery.rule if plan else "?"),
+        "plan_reason":    (plan.battery.reason if plan else ""),
     })
 
 
@@ -240,24 +283,32 @@ _HTML = r"""<!DOCTYPE html>
          display: flex; flex-direction: column; overflow: hidden; }
 
   /* ---- Status strip ---- */
-  #strip { background: #161b22; border-bottom: 1px solid #30363d; padding: 10px 16px;
+  #strip { background: #161b22; border-bottom: 1px solid #30363d; padding: 8px 16px;
            flex-shrink: 0; }
-  .row { display: flex; flex-wrap: wrap; gap: 6px 20px; align-items: center;
+  .row { display: flex; flex-wrap: wrap; gap: 4px 16px; align-items: center;
          font-size: 13px; line-height: 1.6; }
-  .row + .row { margin-top: 4px; }
+  .row + .row { margin-top: 3px; }
   .lbl  { color: #8b949e; font-size: 11px; text-transform: uppercase; margin-right: 4px; }
   .val  { color: #c9d1d9; font-weight: bold; }
-  .val.pos  { color: #3fb950; }   /* exporting / savings */
-  .val.neg  { color: #f85149; }   /* importing */
-  .val.warn { color: #d29922; }   /* caution */
-  .val.info { color: #58a6ff; }   /* shadow mode / info */
+  .val.pos  { color: #3fb950; }
+  .val.neg  { color: #f85149; }
+  .val.warn { color: #d29922; }
+  .val.info { color: #58a6ff; }
   .sep { color: #30363d; }
-  #plan-row .reason { color: #8b949e; font-size: 11px; font-style: italic; }
+  .reason { color: #8b949e; font-size: 11px; font-style: italic; }
   #mode-tag { display: inline-block; padding: 1px 7px; border-radius: 9px;
               font-size: 11px; font-weight: bold; background: #1c2128;
               border: 1px solid #30363d; }
   #mode-tag.shadow { color: #d29922; border-color: #d29922; }
   #mode-tag.live   { color: #3fb950; border-color: #3fb950; }
+  #replan-btn {
+    background: #1c2128; border: 1px solid #30363d; color: #c9d1d9;
+    padding: 2px 10px; border-radius: 4px; cursor: pointer;
+    font-family: monospace; font-size: 11px;
+    transition: border-color 0.15s, color 0.15s;
+  }
+  #replan-btn:hover:not(:disabled) { border-color: #58a6ff; color: #58a6ff; }
+  #replan-btn:disabled { cursor: wait; opacity: 0.65; }
 
   /* ---- Chart panel ---- */
   #chart-panel { flex: 1; position: relative; min-height: 0; padding: 8px 12px; }
@@ -273,53 +324,70 @@ _HTML = r"""<!DOCTYPE html>
 
 <!-- Panel 1: Status strip -->
 <div id="strip">
-  <div id="live-row" class="row">
-    <span><span class="lbl">Battery</span><span id="soc" class="val">—</span></span>
+  <!-- Row 1: Live power readings -->
+  <div class="row">
+    <span><span class="lbl">Battery</span><span id="soc" class="val">&#8212;</span></span>
     <span class="sep">|</span>
-    <span><span class="lbl">PV</span><span id="pv" class="val">—</span></span>
+    <span><span class="lbl">PV</span><span id="pv" class="val">&#8212;</span></span>
     <span class="sep">|</span>
-    <span><span class="lbl">Load</span><span id="load" class="val">—</span></span>
+    <span><span class="lbl">Load</span><span id="load" class="val">&#8212;</span></span>
     <span class="sep">|</span>
-    <span><span class="lbl">Grid</span><span id="grid" class="val">—</span></span>
+    <span><span class="lbl">Grid</span><span id="grid" class="val">&#8212;</span></span>
     <span class="sep">|</span>
-    <span><span class="lbl">Updated</span><span id="updated" class="val">—</span></span>
+    <span><span class="lbl">Updated</span><span id="updated" class="val">&#8212;</span></span>
   </div>
-  <div id="plan-row" class="row">
-    <span><span class="lbl">Plan</span><span id="plan-text" class="val">—</span></span>
+  <!-- Row 2: Plan -->
+  <div class="row">
+    <span><span class="lbl">Plan</span><span id="plan-text" class="val">&#8212;</span></span>
     <span class="sep">|</span>
-    <span><span class="lbl">Rule</span><span id="plan-rule" class="val">—</span></span>
+    <span><span class="lbl">Rule</span><span id="plan-rule" class="val">&#8212;</span></span>
     <span id="plan-reason" class="reason"></span>
   </div>
-  <div id="mode-row" class="row">
+  <!-- Row 3: DHW + Tariff -->
+  <div class="row">
+    <span><span class="lbl">DHW</span><span id="dhw" class="val">&#8212;</span></span>
+    <span class="sep">|</span>
+    <span id="tariff" class="val">&#8212;</span>
+    <span class="sep">|</span>
+    <span id="tariff-event" class="val info">&#8212;</span>
+  </div>
+  <!-- Row 4: Mode + Savings + Replan -->
+  <div class="row">
     <span><span id="mode-tag" class="shadow">SHADOW</span></span>
     <span class="sep">|</span>
-    <span><span class="lbl">Today hypothetical savings*</span><span id="sav-today" class="val pos">—</span></span>
+    <span><span class="lbl">Today*</span><span id="sav-today" class="val pos" title="Positive = optimizer would save vs. actual. Negative = actual was cheaper (shadow plan not optimal yet).">&#8212;</span></span>
     <span class="sep">|</span>
-    <span><span class="lbl">This month</span><span id="sav-month" class="val pos">—</span></span>
+    <span><span class="lbl">Month*</span><span id="sav-month" class="val pos" title="Cumulative 30-day hypothetical savings.">&#8212;</span></span>
     <span class="sep">|</span>
-    <span><span class="lbl">v</span><span id="version" class="val">—</span></span>
-    <span style="color:#555;font-size:10px">* assuming perfect execution; approximate</span>
+    <span><span class="lbl">v</span><span id="version" class="val">&#8212;</span></span>
+    <span class="sep">|</span>
+    <button id="replan-btn" onclick="forceReplan()">Replan</button>
+    <span style="color:#555;font-size:10px">* hypothetical; assumes perfect execution</span>
   </div>
 </div>
 
 <!-- Panel 2: Timeline chart -->
 <div id="chart-panel">
-  <div id="loading">Loading chart…</div>
+  <div id="loading">Loading chart&#8230;</div>
   <canvas id="timeline"></canvas>
 </div>
 
 <script>
-// ---- helpers ----
 const $ = id => document.getElementById(id);
 function cls(el, ...classes) { el.className = classes.join(' '); }
 
-// ---- status strip polling ----
+// ---- Status strip (polled every 30 s) ----
 async function refreshStatus() {
   try {
     const s = await fetch('api/status').then(r => r.json());
 
-    const socKwh = (s.soc_pct / 100 * s.bat_cap_kwh).toFixed(2);
-    $('soc').textContent = `${s.soc_pct.toFixed(1)}% (${socKwh}/${s.bat_cap_kwh} kWh)`;
+    // Battery: SoC% + direction arrow + kWh
+    const kwh    = (s.soc_pct / 100 * s.bat_cap_kwh).toFixed(2);
+    const bkw    = Math.abs(s.battery_kw).toFixed(2);
+    const arrow  = s.battery_dir === 'charging' ? '↑' : (s.battery_dir === 'discharging' ? '↓' : '→');
+    const socEl  = $('soc');
+    socEl.textContent = `${s.soc_pct.toFixed(1)}% ${arrow}${bkw}kW (${kwh}/${s.bat_cap_kwh}kWh)`;
+    cls(socEl, 'val', s.battery_dir === 'charging' ? 'pos' : (s.battery_dir === 'discharging' ? 'warn' : ''));
 
     $('pv').textContent   = `${s.pv_kw.toFixed(2)} kW`;
     $('load').textContent = `${s.load_kw.toFixed(2)} kW`;
@@ -342,38 +410,75 @@ async function refreshStatus() {
     $('plan-rule').textContent = s.rule;
     $('plan-reason').textContent = s.plan_reason !== s.plan_text ? s.plan_reason : '';
 
-    const savings_t = s.savings_today.toFixed(2);
-    const savings_m = s.savings_month.toFixed(2);
-    $('sav-today').textContent = `${savings_t} PLN`;
-    $('sav-month').textContent = `${savings_m} PLN`;
+    // DHW
+    const dhwLabels = {heat_solar: 'solar heat', heat_comfort: 'comfort heat', coast: 'coasting', unknown: '—'};
+    $('dhw').textContent = `${s.dhw_temp.toFixed(1)}°C → ${dhwLabels[s.dhw_type] || s.dhw_type}`;
+
+    // Tariff
+    const tariffEl = $('tariff');
+    tariffEl.textContent = `${s.is_peak_now ? 'PEAK' : 'OFF-PEAK'} ${s.tariff_price.toFixed(2)} PLN/kWh`;
+    cls(tariffEl, 'val', s.is_peak_now ? 'neg' : 'pos');
+    $('tariff-event').textContent = s.tariff_event;
+
+    // Savings (negative = actual was cheaper)
+    const fmtSav = v => v >= 0 ? `+${v.toFixed(2)} PLN` : `${v.toFixed(2)} PLN`;
+    $('sav-today').textContent = fmtSav(s.savings_today);
     cls($('sav-today'), 'val', s.savings_today >= 0 ? 'pos' : 'neg');
+    $('sav-month').textContent = fmtSav(s.savings_month);
     cls($('sav-month'), 'val', s.savings_month >= 0 ? 'pos' : 'neg');
 
     const modeTag = $('mode-tag');
-    if (s.mode === 'live') {
-      modeTag.textContent = 'LIVE';
-      cls(modeTag, 'live');
-    } else {
-      modeTag.textContent = 'SHADOW';
-      cls(modeTag, 'shadow');
-    }
+    modeTag.textContent = s.mode === 'live' ? 'LIVE' : 'SHADOW';
+    cls(modeTag, s.mode === 'live' ? 'live' : 'shadow');
 
     $('version').textContent = s.version;
   } catch(e) { console.warn('status error', e); }
 }
 
-// ---- chart ----
+// ---- Force replan ----
+async function forceReplan() {
+  const btn = $('replan-btn');
+  const orig = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = 'Running...';
+  try {
+    const r = await fetch('api/replan', {method: 'POST'});
+    const j = await r.json();
+    if (j.ok) {
+      btn.textContent = 'Done';
+      btn.style.color = '#3fb950';
+      btn.style.borderColor = '#3fb950';
+      setTimeout(() => { refreshStatus(); buildChart(); }, 3000);
+    } else {
+      btn.textContent = 'Failed';
+      btn.style.color = '#f85149';
+      btn.style.borderColor = '#f85149';
+    }
+  } catch(e) {
+    btn.textContent = 'Error';
+    btn.style.color = '#f85149';
+  } finally {
+    setTimeout(() => {
+      btn.textContent = orig;
+      btn.disabled = false;
+      btn.style.color = '';
+      btn.style.borderColor = '';
+    }, 5000);
+  }
+}
+
+// ---- Chart ----
 let chart = null;
 
 // "now" vertical line plugin
 const nowPlugin = {
   id: 'nowLine',
   afterDraw(chart) {
-    const nowSlot = chart.config._nowSlot;
-    if (nowSlot == null) return;
+    const pos = chart.config._nowPos;
+    if (pos == null) return;
     const xs = chart.scales.x;
     if (!xs) return;
-    const x = xs.getPixelForValue(nowSlot);
+    const x = xs.getPixelForValue(pos);
     const {top, bottom} = chart.chartArea, ctx = chart.ctx;
     ctx.save();
     ctx.beginPath(); ctx.moveTo(x, top); ctx.lineTo(x, bottom);
@@ -398,18 +503,15 @@ const peakPlugin = {
     ctx.fillStyle = 'rgba(255, 80, 80, 0.08)';
     let inPeak = false, peakStart = 0;
     for (let i = 0; i < peaks.length; i++) {
-      if (peaks[i] && !inPeak) { inPeak = true; peakStart = i; }
-      else if (!peaks[i] && inPeak) {
-        inPeak = false;
-        const x1 = xs.getPixelForValue(peakStart);
-        const x2 = xs.getPixelForValue(i);
-        ctx.fillRect(x1, top, x2 - x1, bottom - top);
+      if (peaks[i] && !inPeak)       { inPeak = true; peakStart = i; }
+      else if (!peaks[i] && inPeak)  { inPeak = false;
+        ctx.fillRect(xs.getPixelForValue(peakStart), top,
+                     xs.getPixelForValue(i) - xs.getPixelForValue(peakStart), bottom - top);
       }
     }
     if (inPeak) {
-      const x1 = xs.getPixelForValue(peakStart);
-      const x2 = xs.getPixelForValue(peaks.length - 1);
-      ctx.fillRect(x1, top, x2 - x1, bottom - top);
+      ctx.fillRect(xs.getPixelForValue(peakStart), top,
+                   xs.getPixelForValue(peaks.length - 1) - xs.getPixelForValue(peakStart), bottom - top);
     }
     ctx.restore();
   }
@@ -426,9 +528,8 @@ const chargePlugin = {
     ctx.save();
     ctx.fillStyle = 'rgba(88, 166, 255, 0.12)';
     for (const w of windows) {
-      const x1 = xs.getPixelForValue(w.start_slot);
-      const x2 = xs.getPixelForValue(w.end_slot);
-      ctx.fillRect(x1, top, x2 - x1, bottom - top);
+      ctx.fillRect(xs.getPixelForValue(w.start_slot), top,
+                   xs.getPixelForValue(w.end_slot) - xs.getPixelForValue(w.start_slot), bottom - top);
     }
     ctx.restore();
   }
@@ -439,11 +540,19 @@ async function buildChart() {
     const d = await fetch('api/timeline').then(r => r.json());
     $('loading').style.display = 'none';
 
-    const canvas = $('timeline');
-    const ctx = canvas.getContext('2d');
+    // Rolling window: 8 h history + 36 h future
+    const winStart = Math.max(0, d.current_slot - 16);
+    const winEnd   = Math.min(95, d.current_slot + 72);
+    const nowPos   = d.current_slot - winStart;
+    const sl = arr => (arr || []).slice(winStart, winEnd + 1);
 
-    // Tick every 2h (every 4th 30-min slot)
-    const tickLabels = d.labels.map((l, i) => (i % 4 === 0 ? l : ''));
+    const winLabels  = sl(d.labels);
+    const tickLabels = winLabels.map((l, i) => ((winStart + i) % 4 === 0 ? l : ''));
+
+    // Adjust charge windows to windowed indices
+    const chargeWindows = (d.charge_windows || [])
+      .map(w => ({...w, start_slot: w.start_slot - winStart, end_slot: w.end_slot - winStart}))
+      .filter(w => w.end_slot >= 0 && w.start_slot <= winEnd - winStart);
 
     const YELLOW      = 'rgba(255, 200, 60, 0.9)';
     const YELLOW_DARK = 'rgba(200, 150, 30, 0.9)';
@@ -453,51 +562,45 @@ async function buildChart() {
     const BLUE_SOLID  = 'rgba(88, 166, 255, 1.0)';
 
     const datasets = [
-      // Left axis — kW
       {
-        label: 'PV forecast (kW)', yAxisID: 'y', data: d.pv_forecast,
+        label: 'PV forecast (kW)', yAxisID: 'y', data: sl(d.pv_forecast),
         borderColor: YELLOW, backgroundColor: 'transparent',
         borderWidth: 1.5, borderDash: [4, 3], pointRadius: 0, tension: 0.3,
       },
       {
-        label: 'PV actual (kW)', yAxisID: 'y', data: d.actual_pv,
+        label: 'PV actual (kW)', yAxisID: 'y', data: sl(d.actual_pv),
         borderColor: YELLOW_DARK, backgroundColor: 'transparent',
-        borderWidth: 2.5, pointRadius: 0, tension: 0.3,
-        spanGaps: false,
+        borderWidth: 2.5, pointRadius: 0, tension: 0.3, spanGaps: false,
       },
       {
-        label: 'Load forecast (kW)', yAxisID: 'y', data: d.load_forecast,
+        label: 'Load forecast (kW)', yAxisID: 'y', data: sl(d.load_forecast),
         borderColor: GREY, backgroundColor: 'transparent',
         borderWidth: 1.5, borderDash: [4, 3], pointRadius: 0, tension: 0.3,
       },
       {
-        label: 'Load actual (kW)', yAxisID: 'y', data: d.actual_load,
+        label: 'Load actual (kW)', yAxisID: 'y', data: sl(d.actual_load),
         borderColor: GREY_DARK, backgroundColor: 'transparent',
-        borderWidth: 2.5, pointRadius: 0, tension: 0.3,
-        spanGaps: false,
+        borderWidth: 2.5, pointRadius: 0, tension: 0.3, spanGaps: false,
       },
-      // Right axis — SoC %
       {
-        label: 'Planned SoC (%)', yAxisID: 'y2', data: d.planned_soc,
+        label: 'Planned SoC (%)', yAxisID: 'y2', data: sl(d.planned_soc),
         borderColor: BLUE_DASH, backgroundColor: 'transparent',
-        borderWidth: 1.5, borderDash: [5, 3], pointRadius: 0, tension: 0.3,
-        spanGaps: false,
+        borderWidth: 1.5, borderDash: [5, 3], pointRadius: 0, tension: 0.3, spanGaps: false,
       },
       {
-        label: 'Actual SoC (%)', yAxisID: 'y2', data: d.actual_soc,
+        label: 'Actual SoC (%)', yAxisID: 'y2', data: sl(d.actual_soc),
         borderColor: BLUE_SOLID, backgroundColor: 'transparent',
-        borderWidth: 2.5, pointRadius: 0, tension: 0.3,
-        spanGaps: false,
+        borderWidth: 2.5, pointRadius: 0, tension: 0.3, spanGaps: false,
       },
     ];
 
     if (chart) { chart.destroy(); chart = null; }
 
-    chart = new Chart(ctx, {
+    chart = new Chart($('timeline').getContext('2d'), {
       type: 'line',
-      _nowSlot:      d.current_slot,
-      _peaks:        d.is_peak,
-      _chargeWindows: d.charge_windows,
+      _nowPos:        nowPos,
+      _peaks:         sl(d.is_peak),
+      _chargeWindows: chargeWindows,
       data: { labels: tickLabels, datasets },
       options: {
         animation: false,
@@ -510,17 +613,22 @@ async function buildChart() {
           },
           tooltip: {
             backgroundColor: 'rgba(22,27,34,0.95)',
-            borderColor: '#30363d',
-            borderWidth: 1,
-            titleColor: '#c9d1d9',
-            bodyColor: '#8b949e',
+            borderColor: '#30363d', borderWidth: 1,
+            titleColor: '#c9d1d9', bodyColor: '#8b949e',
             callbacks: {
               title: items => {
-                const i = items[0].dataIndex;
-                return `Slot ${i}: ${d.labels[i]}  ${d.is_peak[i] ? '⚡ peak tariff' : ''}`;
+                const gi = winStart + items[0].dataIndex;
+                const price = d.is_peak[gi] ? '1.23 PLN/kWh' : '0.63 PLN/kWh';
+                return `${d.labels[gi]}  ${d.is_peak[gi] ? 'PEAK' : 'off-peak'} • ${price}`;
               },
-              afterBody: () => {
-                return [`Rule: ${d.plan_rule}  ${d.plan_reason}`];
+              afterBody: items => {
+                const gi = winStart + items[0].dataIndex;
+                const lines = [];
+                if (gi === d.current_slot)
+                  lines.push(`Rule: ${d.plan_rule}  —  ${d.plan_reason}`);
+                const cw = d.charge_windows.find(w => gi >= w.start_slot && gi <= w.end_slot);
+                if (cw) lines.push(`Grid-charge window → ${cw.target_soc}%`);
+                return lines;
               },
             },
           },
@@ -560,7 +668,7 @@ async function buildChart() {
 refreshStatus();
 buildChart();
 setInterval(refreshStatus, 30_000);
-setInterval(buildChart, 30 * 60_000);
+setInterval(buildChart, 5 * 60_000);
 </script>
 </body>
 </html>"""

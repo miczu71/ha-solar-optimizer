@@ -19,6 +19,7 @@ from mqtt_publisher import MQTTPublisher
 from planner import Planner, Plan, format_plan_text
 from tariff import (
     datetime_to_slot,
+    is_peak,
     peak_vector_96,
     price_at,
 )
@@ -162,10 +163,11 @@ def replan(
         load_96 = build_load_forecast_96(ha, cfg)
         is_peak_96 = peak_vector_96(now_local, workday_today, workday_tomorrow)
 
-        soc      = ha.soc_percent
-        pv_now   = ha.pv_power_w / 1000
-        load_now = ha.house_load_w / 1000
-        dhw_temp = ha.dhw_tank_temp
+        soc        = ha.soc_percent
+        pv_now     = ha.pv_power_w / 1000
+        load_now   = ha.house_load_w / 1000
+        battery_kw = ha.battery_net_w / 1000
+        dhw_temp   = ha.dhw_tank_temp
         outdoor  = ha.outdoor_temp
         ac_states = _ac_states(ha)
         bath_req  = ha.bath_request
@@ -232,8 +234,19 @@ def replan(
         set_state("is_peak_96", is_peak_96)
         set_state("cfg", cfg)
         set_state("ha", ha)
-        set_state("savings_today", today_pln)
-        set_state("savings_month", month_pln)
+        set_state("savings_today",    today_pln)
+        set_state("savings_month",    month_pln)
+        set_state("soc_pct",          soc)
+        set_state("pv_kw",            pv_now)
+        set_state("load_kw",          load_now)
+        set_state("grid_kw",          grid_kw)
+        set_state("battery_kw",       battery_kw)
+        set_state("dhw_plan",         plan.dhw)
+        set_state("dhw_temp",         dhw_temp)
+        set_state("is_peak_now",      is_peak(now_local, workday_today))
+        set_state("tariff_price",     tariff_price)
+        set_state("workday_today",    workday_today)
+        set_state("workday_tomorrow", workday_tomorrow)
 
         log.info(
             "Replan OK rule=%s pv=%.1f kWh load=%.1f kWh soc=%.0f%% shadow_savings=%.2f PLN",
